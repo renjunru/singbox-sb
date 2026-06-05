@@ -1,0 +1,22 @@
+# 真实配置 / 含节点密码 —— 绝不上传
+config.json
+config.tun.json
+config.json.bak*
+tun-inbound.json
+
+# 订阅与运行时状态
+subscription-nodes.json
+subscriptions/
+sb-state.json
+
+# 缓存 / 日志 / 诊断
+cache.db
+*.log
+diagnostics/
+
+# 下载得来的第三方资源
+ui/
+rules/*.srs
+
+# 系统杂项
+.DS_Store

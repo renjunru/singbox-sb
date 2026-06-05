@@ -1,0 +1,2759 @@
+#!/usr/bin/env python3
+"""sb - sing-box mixed 日常管理工具 (macOS / launchd)
+
+命令面与原脚本保持一致；相比原版的主要改进：
+- clash_request 只保留一份（去掉重复的 *_quiet 版本）
+- 删除死代码 clash_api_ok
+- 端口 / Clash API 地址 / secret 从 config.json 读取，常量仅作兜底默认
+- start 后轮询等待端口就绪再报状态
+- stop 优先 launchctl bootout，仅在仍存活时才兜底 kill
+- set_route_main 在匹配为 0 时不写盘、不产生无用备份
+- 底层函数抛 SbError，由 main() 统一兜底，便于复用/测试
+"""
+
+import base64
+import json
+import os
+import plistlib
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 路径 / 标识
+# ---------------------------------------------------------------------------
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "sing-box"
+CONFIG = CONFIG_DIR / "config.json"
+LOG = CONFIG_DIR / "sing-box.log"
+ERR_LOG = CONFIG_DIR / "sing-box.err.log"
+DIAG_DIR = CONFIG_DIR / "diagnostics"
+# 日志按模式分目录归档：diagnostics/tun/<时间戳>/ 与 diagnostics/mixed/<时间戳>/
+# 每个模式各自维护一个 latest 软链，便于网络分析时直接定位最近一次
+LOG_MODES = ("tun", "mixed")
+# 连接快照（sb conns）存放处：diagnostics/conns/<时间戳>.json
+CONNS_DIR = DIAG_DIR / "conns"
+STATE_FILE = CONFIG_DIR / "sb-state.json"
+PLIST = HOME / "Library" / "LaunchAgents" / "com.local.sing-box.mixed.plist"
+LABEL = "com.local.sing-box.mixed"
+
+# tun 模式（需要 root；以系统级 LaunchDaemon 后台运行）
+DAEMON_PLIST = Path("/Library/LaunchDaemons/com.local.sing-box.tun.plist")
+DAEMON_LABEL = "com.local.sing-box.tun"
+TUN_INBOUND = CONFIG_DIR / "tun-inbound.json"   # 抽出的 tun 入站定义（默认配置不含 tun）
+TUN_CONFIG = CONFIG_DIR / "config.tun.json"      # 由 config.json + tun-inbound.json 合成
+
+# 本地 rule_set（.srs）与其来源清单（tag/url/filename）
+RULES_DIR = CONFIG_DIR / "rules"
+RULES_SOURCES = RULES_DIR / "sources.json"
+
+# 兜底默认值；真实值优先从 config.json 读取（见 _read_runtime_settings）
+DEFAULT_LISTEN_HOST = "127.0.0.1"
+DEFAULT_LISTEN_PORT = 7890
+DEFAULT_CLASH_HOST = "127.0.0.1"
+DEFAULT_CLASH_PORT = 9090
+
+NETWORK_SERVICES = [
+    "Ethernet",
+    "Wi-Fi",
+    "iPhone USB",
+]
+
+# tun 模式下把系统 DNS 强制指向非局域网地址：逼所有 DNS 查询经隧道、被 route 里的
+# hijack-dns 截获，fake-ip 才能真正接管。否则系统默认把查询发往 LAN 路由器（直连在
+# 物理网卡上、不过 tun），macOS 的 strict_route 也抓不住，导致 fake-ip 失效、域名被
+# GFW 投毒。223.5.5.5 同时也是 tun 关闭时可用的国内解析（不影响断流场景）。
+TUN_GUARD_DNS = ["223.5.5.5", "119.29.29.29"]
+
+# 已知的第三方科学上网 GUI（白名单；按需增删）。启动 sing-box 前关掉它们，
+# 避免它们抢系统代理 / TUN。只列用户态 GUI（不含 sing-box 自身，也不碰
+# 需要 sudo 的 root 后台 helper，如 ClashBar 的 clashmac/liquidclash-helper）。
+OTHER_PROXY_APPS = [
+    "Shadowrocket",
+    "ClashBar", "ClashX", "ClashX Pro",
+    "Clash Verge", "Clash Verge Rev", "Mihomo Party", "FlClash",
+    "Loon 2", "Loon",
+    "Surge", "Stash", "Quantumult X", "Quantumult",
+    "V2RayU", "V2RayX", "Hiddify", "Karing",
+]
+
+# 服务 -> 对应的可切换选择器（YouTube/Google/GitHub/Telegram 现在是 selector）
+SERVICE_SELECTORS = {
+    "youtube": "youtube",
+    "google": "google",
+    "github": "github",
+    "telegram": "telegram",
+}
+
+MAIN_SERVICES = ["youtube", "google", "github", "telegram"]
+
+# 组名 -> Clash API / config 里的策略组 tag。`use` 和 `set` 共用这张表。
+# use <组> = 即时切换(走 Clash API)；set <组> = 写持久默认值(改 config.json)。
+# 参数统一为「编号(见 sb use/set <组> list) / auto / 名字」。
+USE_GROUPS = {
+    "sg": "sg", "us": "us", "hk": "hk", "jp": "jp", "tw": "tw",
+    "proxy": "proxy", "ai": "ai",
+    "youtube": "youtube", "google": "google",
+    "github": "github", "telegram": "telegram",
+}
+
+# status / selectors 共用的策略组名单（去重，集中一处）
+WANTED_SELECTORS = [
+    "proxy",
+    "ai",
+    "youtube",
+    "google",
+    "github",
+    "telegram",
+    "sg",
+    "us",
+    "hk",
+    "jp",
+    "tw",
+]
+
+
+class SbError(Exception):
+    """用户可见的、预期内的错误；由 main() 统一打印并退出。"""
+
+
+# ---------------------------------------------------------------------------
+# 运行时设置：尽量从 config.json 读取，读不到则用默认
+# ---------------------------------------------------------------------------
+def _read_runtime_settings():
+    host, port = DEFAULT_LISTEN_HOST, DEFAULT_LISTEN_PORT
+    chost, cport = DEFAULT_CLASH_HOST, DEFAULT_CLASH_PORT
+    secret = ""
+
+    if CONFIG.exists():
+        try:
+            data = json.loads(CONFIG.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+
+        if isinstance(data, dict):
+            for ib in data.get("inbounds", []):
+                if ib.get("type") in ("mixed", "http", "socks"):
+                    host = ib.get("listen", host)
+                    port = ib.get("listen_port", port)
+                    break
+
+            clash = data.get("experimental", {}).get("clash_api", {})
+            ec = clash.get("external_controller", f"{chost}:{cport}")
+            ec_host, _, ec_port = ec.partition(":")
+            chost = ec_host or chost
+            try:
+                cport = int(ec_port) if ec_port else cport
+            except ValueError:
+                pass
+            secret = clash.get("secret", "") or ""
+
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = DEFAULT_LISTEN_PORT
+
+    return host, port, chost, cport, secret
+
+
+LISTEN_HOST, LISTEN_PORT, CLASH_HOST, CLASH_PORT, CLASH_SECRET = _read_runtime_settings()
+CLASH_API = f"http://{CLASH_HOST}:{CLASH_PORT}"
+
+
+# ---------------------------------------------------------------------------
+# 状态文件 / 日志路径
+# ---------------------------------------------------------------------------
+def load_state():
+    default = {"auto_save_logs": False, "current_log_dir": "", "active_sub": "", "dns_backup": {}}
+    if not STATE_FILE.exists():
+        return dict(default)
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as f:
+            state = json.load(f)
+        for k, v in default.items():
+            state.setdefault(k, v)
+        return state
+    except Exception:
+        return dict(default)
+
+
+def save_state(state):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with STATE_FILE.open("w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def is_auto_log_enabled():
+    return bool(load_state().get("auto_save_logs"))
+
+
+def mode_log_root(mode):
+    """某模式的日志归档根目录：diagnostics/tun 或 diagnostics/mixed。"""
+    return DIAG_DIR / mode
+
+
+def _update_latest(base, run_dir):
+    """把 base/latest 软链指向最近一次 run 目录（相对链接，便于 tail -f）。"""
+    link = base / "latest"
+    try:
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(run_dir.name)
+    except OSError:
+        pass
+
+
+def prepare_log_paths_for_launch(mode):
+    """返回 launchd 的 stdout/stderr 路径；tun 与 mixed 统一走这里。
+
+    mode: "tun" / "mixed"，决定归档到哪个子目录。
+    auto_save_logs = True  -> 建独立 run 目录 diagnostics/<mode>/<时间戳>/，
+                              并更新该模式的 latest 软链（不自动清理，手动 sb log clean）
+    auto_save_logs = False -> 写入 /dev/null
+    """
+    state = load_state()
+
+    if not state.get("auto_save_logs"):
+        state["current_log_dir"] = ""
+        save_state(state)
+        return "/dev/null", "/dev/null"
+
+    base = mode_log_root(mode)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = base / timestamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    state["current_log_dir"] = str(run_dir)
+    save_state(state)
+    _update_latest(base, run_dir)
+
+    return str(run_dir / "sing-box.log"), str(run_dir / "sing-box.err.log")
+
+
+def current_log_paths():
+    current_dir = load_state().get("current_log_dir") or ""
+    if current_dir:
+        d = Path(current_dir)
+        return d / "sing-box.log", d / "sing-box.err.log"
+    return LOG, ERR_LOG
+
+
+# ---------------------------------------------------------------------------
+# 子进程 / 配置文件
+# ---------------------------------------------------------------------------
+def run(cmd, check=False, capture=False, timeout=None):
+    try:
+        if capture:
+            return subprocess.run(cmd, check=check, text=True, timeout=timeout,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return subprocess.run(cmd, check=check, timeout=timeout)
+    except FileNotFoundError:
+        raise SbError(f"找不到命令：{cmd[0]}")
+    except subprocess.TimeoutExpired:
+        # 超时不致命（典型：osascript 卡在 TCC 授权框）；当作失败返回，由调用方兜底
+        return subprocess.CompletedProcess(cmd, returncode=124, stdout="", stderr="")
+
+
+def require_config():
+    if not CONFIG.exists():
+        raise SbError(f"找不到配置文件：{CONFIG}")
+
+
+def load_config():
+    require_config()
+    with CONFIG.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_config(data):
+    backup = CONFIG.with_suffix(".json.bak")
+    shutil.copy2(CONFIG, backup)
+    with CONFIG.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"已保存配置；备份：{backup}")
+
+
+def check_config():
+    result = run(["sing-box", "check", "-c", str(CONFIG)], capture=True)
+    if result.returncode != 0:
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        raise SbError("配置检查失败，未继续执行。")
+
+
+def update_rules():
+    """按 rules/sources.json 重新下载本地 .srs 规则集。
+
+    带回滚：先全部下到 .tmp，任一失败即中止（旧规则原样保留）；
+    全部成功才替换，替换后校验 config；校验不过自动回滚。
+    """
+    if not RULES_SOURCES.exists():
+        raise SbError(f"找不到规则来源清单：{RULES_SOURCES}")
+    try:
+        sources = json.loads(RULES_SOURCES.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise SbError(f"解析 {RULES_SOURCES} 失败：{e}")
+    if not isinstance(sources, list) or not sources:
+        raise SbError("sources.json 为空或格式不对。")
+
+    use_proxy = is_port_listening()
+    if use_proxy:
+        print(f"经代理下载：http://{LISTEN_HOST}:{LISTEN_PORT}")
+    else:
+        print("代理端口未监听，改为直连下载（国内可能失败，建议先 sb start）。")
+
+    RULES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 阶段 1：全部下载到 .tmp，任一失败即中止
+    pending = []  # (dest_path, tmp_path)
+    for item in sources:
+        tag = item.get("tag", "?")
+        url = item.get("url")
+        fn = item.get("filename")
+        if not url or not fn:
+            raise SbError(f"sources.json 条目缺 url/filename：{tag}")
+
+        dest = RULES_DIR / fn
+        tmp = RULES_DIR / (fn + ".tmp")
+        cmd = ["curl", "-fsSL",
+               "--connect-timeout", "15", "--max-time", "45",
+               "--retry", "3", "--retry-delay", "2", "--retry-all-errors"]
+        if use_proxy:
+            cmd += ["-x", f"http://{LISTEN_HOST}:{LISTEN_PORT}"]
+        cmd += [url, "-o", str(tmp)]
+
+        result = run(cmd, capture=True)
+        if result.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            tmp.unlink(missing_ok=True)
+            for _, t in pending:
+                t.unlink(missing_ok=True)
+            print(result.stderr.strip(), file=sys.stderr)
+            raise SbError(f"下载失败：{tag}（{url}）。已中止，旧规则未改动。")
+
+        print(f"  ✓ {tag}  ({tmp.stat().st_size} B)")
+        pending.append((dest, tmp))
+
+    # 阶段 2：原子替换（旧文件挪到 .old，便于回滚）
+    swapped = []  # (dest, old_or_None)
+    for dest, tmp in pending:
+        old = None
+        if dest.exists():
+            old = dest.with_name(dest.name + ".old")
+            dest.replace(old)
+        tmp.replace(dest)
+        swapped.append((dest, old))
+
+    # 阶段 3：校验，失败则回滚
+    print("校验配置…")
+    try:
+        check_config()
+    except SbError:
+        for dest, old in swapped:
+            if old is not None:
+                old.replace(dest)
+        raise SbError("更新后配置校验失败，已回滚到旧规则。")
+
+    for _, old in swapped:
+        if old is not None:
+            old.unlink(missing_ok=True)
+
+    print(f"规则已更新（{len(pending)} 个），配置校验通过。")
+    print("执行 sb restart 后生效（本地 rule_set 在启动时加载）。")
+
+
+# ---------------------------------------------------------------------------
+# 系统代理 (networksetup)
+# ---------------------------------------------------------------------------
+def service_exists(service):
+    return run(["networksetup", "-getwebproxy", service], capture=True).returncode == 0
+
+
+def set_proxy_for_service(service):
+    if not service_exists(service):
+        print(f"跳过不存在的网络服务：{service}")
+        return
+
+    commands = [
+        ["networksetup", "-setwebproxy", service, LISTEN_HOST, str(LISTEN_PORT)],
+        ["networksetup", "-setsecurewebproxy", service, LISTEN_HOST, str(LISTEN_PORT)],
+        ["networksetup", "-setsocksfirewallproxy", service, LISTEN_HOST, str(LISTEN_PORT)],
+        ["networksetup", "-setwebproxystate", service, "on"],
+        ["networksetup", "-setsecurewebproxystate", service, "on"],
+        ["networksetup", "-setsocksfirewallproxystate", service, "on"],
+    ]
+    for cmd in commands:
+        run(cmd)
+    print(f"已设置系统代理：{service} -> {LISTEN_HOST}:{LISTEN_PORT}")
+
+
+def clear_proxy_for_service(service):
+    if not service_exists(service):
+        print(f"跳过不存在的网络服务：{service}")
+        return
+
+    commands = [
+        ["networksetup", "-setwebproxystate", service, "off"],
+        ["networksetup", "-setsecurewebproxystate", service, "off"],
+        ["networksetup", "-setsocksfirewallproxystate", service, "off"],
+    ]
+    for cmd in commands:
+        run(cmd)
+    print(f"已关闭系统代理：{service}")
+
+
+def set_all_proxies():
+    for service in NETWORK_SERVICES:
+        set_proxy_for_service(service)
+
+
+def clear_all_proxies():
+    for service in NETWORK_SERVICES:
+        clear_proxy_for_service(service)
+
+
+def proxy_status(service):
+    if not service_exists(service):
+        return "不存在"
+
+    items = [
+        ("HTTP", ["networksetup", "-getwebproxy", service]),
+        ("HTTPS", ["networksetup", "-getsecurewebproxy", service]),
+        ("SOCKS", ["networksetup", "-getsocksfirewallproxy", service]),
+    ]
+
+    parts = []
+    for name, cmd in items:
+        result = run(cmd, capture=True)
+        enabled, server, port = "No", "", ""
+        for line in result.stdout.splitlines():
+            if line.startswith("Enabled:"):
+                enabled = line.split(":", 1)[1].strip()
+            elif line.startswith("Server:"):
+                server = line.split(":", 1)[1].strip()
+            elif line.startswith("Port:"):
+                port = line.split(":", 1)[1].strip()
+        parts.append(f"{name}=ON({server}:{port})" if enabled == "Yes" else f"{name}=off")
+    return ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# 系统 DNS（tun 模式守护：堵住 DNS 泄漏，保证 fake-ip 生效）
+# ---------------------------------------------------------------------------
+
+def get_service_dns(service):
+    """该服务当前手动 DNS 列表；走 DHCP（未手动设置）返回 []。"""
+    r = run(["networksetup", "-getdnsservers", service], capture=True)
+    out = (r.stdout or "").strip()
+    if not out or "aren't any" in out or "There aren" in out:
+        return []
+    servers = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line and all(c.isdigit() or c in ".:" for c in line):  # 只收 IPv4/IPv6
+            servers.append(line)
+    return servers
+
+
+def _set_service_dns(service, servers):
+    # servers=[] → 用字面量 "Empty" 还原成 DHCP 自动获取
+    arg = list(servers) if servers else ["Empty"]
+    run(["networksetup", "-setdnsservers", service] + arg)
+
+
+def flush_dns_cache():
+    run(["dscacheutil", "-flushcache"], capture=True)
+    run(["sudo", "killall", "-HUP", "mDNSResponder"], capture=True)  # 需 sudo；失败无妨
+
+
+def set_tun_dns():
+    """tun 启动后调用：备份各网络服务原始 DNS，再改成 TUN_GUARD_DNS。"""
+    state = load_state()
+    backup = state.get("dns_backup") or {}
+    changed = []
+    for service in NETWORK_SERVICES:
+        if not service_exists(service):
+            continue
+        cur = get_service_dns(service)
+        if cur == TUN_GUARD_DNS:
+            continue  # 已是守护值；保留既有备份，不覆盖
+        backup[service] = cur  # [] 表示原本走 DHCP
+        _set_service_dns(service, TUN_GUARD_DNS)
+        changed.append(service)
+    if changed:
+        state["dns_backup"] = backup
+        save_state(state)
+        flush_dns_cache()
+        print("已将系统 DNS 指向 " + "、".join(TUN_GUARD_DNS) +
+              "（" + "、".join(changed) + "），堵住 DNS 泄漏以保证 fake-ip 生效。")
+
+
+def restore_tun_dns():
+    """tun 停止后调用：把各网络服务 DNS 恢复为启动前的原始设置。"""
+    state = load_state()
+    backup = state.get("dns_backup")
+    if not backup:
+        return
+    for service, servers in backup.items():
+        if service_exists(service):
+            _set_service_dns(service, servers)
+    state["dns_backup"] = {}
+    save_state(state)
+    flush_dns_cache()
+    print("系统 DNS 已恢复为 tun 启动前的设置。")
+
+
+# ---------------------------------------------------------------------------
+# launchd / 进程
+# ---------------------------------------------------------------------------
+def write_plist():
+    sing_box = shutil.which("sing-box")
+    if not sing_box:
+        raise SbError("找不到 sing-box，请确认已 brew install sing-box。")
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    PLIST.parent.mkdir(parents=True, exist_ok=True)
+
+    stdout_path, stderr_path = prepare_log_paths_for_launch("mixed")
+
+    plist = {
+        "Label": LABEL,
+        "ProgramArguments": [sing_box, "run", "-c", str(CONFIG)],
+        "RunAtLoad": False,
+        "KeepAlive": False,
+        "StandardOutPath": stdout_path,
+        "StandardErrorPath": stderr_path,
+        "WorkingDirectory": str(CONFIG_DIR),
+        "EnvironmentVariables": {
+            "PATH": os.environ.get(
+                "PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            )
+        },
+    }
+
+    with PLIST.open("wb") as f:
+        plistlib.dump(plist, f)
+    print(f"已写入 LaunchAgent：{PLIST}")
+
+
+def launchctl_domain():
+    return f"gui/{os.getuid()}"
+
+
+def launchctl_bootout_quiet():
+    run(["launchctl", "bootout", launchctl_domain(), str(PLIST)], capture=True)
+
+
+def launchctl_loaded():
+    """launchd 里该任务是否仍处于已加载状态。"""
+    return run(
+        ["launchctl", "print", f"{launchctl_domain()}/{LABEL}"], capture=True
+    ).returncode == 0
+
+
+def wait_unloaded(timeout=5.0, interval=0.1):
+    """等待上一实例彻底卸载、端口释放。
+
+    bootout 是异步的；若紧接着就 bootstrap，旧任务可能还没退干净，
+    bootstrap 会返回 5 失败（且被静默吞掉）→ 服务始终没被加载 → sing-box
+    没真正启动。restart 正是 stop()+start() 连发，最容易踩到这个竞态。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not launchctl_loaded() and not is_port_listening():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def launchctl_bootstrap():
+    result = run(["launchctl", "bootstrap", launchctl_domain(), str(PLIST)], capture=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "Service is already loaded" not in stderr and "Bootstrap failed: 5" not in stderr:
+            print(result.stdout, end="")
+            print(result.stderr, end="", file=sys.stderr)
+            raise SbError("launchctl bootstrap 失败。")
+
+
+def launchctl_kickstart():
+    result = run(["launchctl", "kickstart", "-k", f"{launchctl_domain()}/{LABEL}"], capture=True)
+    if result.returncode != 0:
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        raise SbError("launchctl kickstart 失败。")
+
+
+def is_port_listening(host=None, port=None):
+    host = host or LISTEN_HOST
+    port = port or LISTEN_PORT
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def wait_port(timeout=3.0, interval=0.1):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if is_port_listening():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _singbox_proc_lines():
+    """真正的 sing-box 进程行（"PID 完整命令行"）。
+
+    pgrep -afil 按整条命令行匹配，命令行里恰好含 "sing-box" 的无关进程
+    （例如本脚本自身：配置目录路径就是 .../sing-box）会被误判为 sing-box
+    在运行。这里再按"可执行文件名是否为 sing-box"过滤掉它们。
+    """
+    out = run(["pgrep", "-afil", "sing-box"], capture=True).stdout
+    lines = []
+    for line in out.splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) == 2 and os.path.basename(parts[1].split(maxsplit=1)[0]) == "sing-box":
+            lines.append(line)
+    return lines
+
+
+def pgrep_singbox():
+    return "\n".join(_singbox_proc_lines())
+
+
+def _singbox_proc_has(substr):
+    """是否存在命令行里包含 substr 的 sing-box 进程（用于区分代理模式 / tun 模式）。"""
+    return any(substr in line for line in _singbox_proc_lines())
+
+
+def tun_running():
+    return _singbox_proc_has(str(TUN_CONFIG))
+
+
+def proxy_running():
+    return _singbox_proc_has(str(CONFIG))
+
+
+# ---------------------------------------------------------------------------
+# Clash API
+# ---------------------------------------------------------------------------
+# Clash API 是本地接口；必须绕开系统/环境代理。
+# 否则 sb start 设置系统代理(127.0.0.1:7890)后，urllib 会把对 9090 的请求
+# 也塞进 7890，被 sing-box 掐断 → RemoteDisconnected。
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def clash_request(method, path, body=None, timeout=5):
+    """底层请求；失败时抛原始异常。"""
+    url = f"{CLASH_API}{path}"
+    headers, data = {}, None
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if CLASH_SECRET:
+        headers["Authorization"] = f"Bearer {CLASH_SECRET}"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
+        raw = resp.read()
+        return json.loads(raw.decode("utf-8")) if raw else None
+
+
+def clash_api_available(timeout=2):
+    try:
+        data = clash_request("GET", "/proxies", timeout=timeout)
+        return isinstance(data, dict) and "proxies" in data
+    except Exception:
+        return False
+
+
+def get_proxies():
+    try:
+        data = clash_request("GET", "/proxies")
+    except Exception as e:
+        raise SbError(
+            f"Clash API 请求失败：{CLASH_API}/proxies\n错误：{e}\n"
+            f"请确认 sing-box 已启动，且 config.json 已开启 "
+            f"experimental.clash_api {CLASH_HOST}:{CLASH_PORT}。"
+        )
+    return data.get("proxies", {}) if isinstance(data, dict) else {}
+
+
+def clash_select(selector, target):
+    encoded = urllib.parse.quote(selector, safe="")
+    try:
+        clash_request("PUT", f"/proxies/{encoded}", {"name": target})
+    except Exception as e:
+        raise SbError(f"即时切换失败：{selector} -> {target}\n错误：{e}")
+    print(f"已即时切换：{selector} -> {target}")
+
+
+# ---------------------------------------------------------------------------
+# 生命周期
+# ---------------------------------------------------------------------------
+def kill_other_proxies():
+    """关掉系统里其它科学上网 GUI，给 sing-box 让出系统代理 / TUN。
+
+    按白名单 OTHER_PROXY_APPS 逐个处理：先 osascript 优雅退出（让网络扩展
+    干净注销），再用 pkill 按 .app 路径兜底强杀（含 .app 内的 TUN 扩展进程）。
+    只动用户态进程；root helper 不碰（pkill 杀不动 root，会被静默忽略，不弹
+    sudo）。检测用更严格的 /Contents/MacOS/ 匹配，避免把空闲的 root helper
+    误算成"GUI 在跑"。返回实际处理的应用名单。
+
+    注：首次 osascript 退出某个 app 时，macOS 可能弹一次「自动化」授权框；
+    即便拒绝，后面的 pkill 兜底仍会生效。
+    """
+    running = [
+        app for app in OTHER_PROXY_APPS
+        if run(["pgrep", "-f", f"/{app}.app/Contents/MacOS/"], capture=True).stdout.strip()
+    ]
+    if not running:
+        return []
+
+    for app in running:
+        run(["osascript", "-e", f'quit app "{app}"'], capture=True, timeout=5)
+    # 轮询等它们优雅退出，最多 1.5s；退得快就立刻继续，不再死等满 1 秒
+    deadline = time.time() + 1.5
+    while time.time() < deadline:
+        still = [
+            app for app in running
+            if run(["pgrep", "-f", f"/{app}.app/Contents/MacOS/"], capture=True).stdout.strip()
+        ]
+        if not still:
+            break
+        time.sleep(0.1)
+    for app in running:
+        run(["pkill", "-f", f"/{app}.app/"], capture=True)
+    return running
+
+
+def start():
+    """默认以 tun（全局透明代理，root 守护）方式启动。
+
+    想用 mixed 代理模式（不需 root）请用 sb start --mixed。
+    """
+    start_tun()
+
+
+def restart():
+    stop()
+    start()
+
+
+def start_mixed():
+    if tun_running():
+        raise SbError("tun 模式（root 守护）正在运行，会抢占端口。请先 sb stop（或 sb tun off）再启动 mixed 模式。")
+    check_config()
+    killed = kill_other_proxies()
+    if killed:
+        print("已关闭其它科学上网工具：" + "、".join(killed))
+    write_plist()
+    launchctl_bootout_quiet()
+    wait_unloaded()  # 等旧实例退干净再 bootstrap，避免 restart 的 launchd 竞态
+    launchctl_bootstrap()
+    launchctl_kickstart()
+
+    if not wait_port():
+        print("警告：端口暂未就绪，sing-box 可能仍在启动或启动失败。", file=sys.stderr)
+
+    set_all_proxies()
+    print("sing-box mixed 已后台启动。")
+
+    if is_auto_log_enabled():
+        out_log, err_log = current_log_paths()
+        print("自动保存日志：已开启")
+        print(f"stdout：{out_log}")
+        print(f"stderr：{err_log}")
+    else:
+        print("自动保存日志：已关闭；后台日志写入 /dev/null")
+    status()
+
+
+def stop():
+    """停掉当前在跑的模式，自动识别 tun / mixed。"""
+    if tun_running():
+        stop_tun()
+    elif proxy_running() or is_port_listening() or pgrep_singbox():
+        stop_mixed()
+    else:
+        clear_all_proxies()
+        print("sing-box 未在运行；系统代理已清理。")
+
+
+def stop_mixed():
+    launchctl_bootout_quiet()
+    # bootout 后通常已退出；仅在仍存活时兜底（此处只可能是用户态代理进程）
+    if is_port_listening() or pgrep_singbox():
+        run(["pkill", "-x", "sing-box"], capture=True)
+    clear_all_proxies()
+    print("sing-box（mixed）已停止，系统代理已清理。")
+
+
+# ---------------------------------------------------------------------------
+# tun 模式（root 后台守护：/Library/LaunchDaemons + system 域）
+# ---------------------------------------------------------------------------
+def sudo_prime():
+    """确保后续 sudo 调用不会在 capture 时静默卡住。
+
+    若已为 tun 守护配置免密 sudo（见 /etc/sudoers.d/sb-singbox-tun），直接返回，
+    全程不弹密码；否则交互式 sudo -v 预热一次凭据（之后的 capture 调用不再卡）。
+    """
+    probe = run(
+        ["sudo", "-n", "-l", "/bin/launchctl", "bootout", f"system/{DAEMON_LABEL}"],
+        capture=True,
+    )
+    if probe.returncode == 0:
+        return
+    if run(["sudo", "-v"]).returncode != 0:
+        raise SbError("需要管理员权限（sudo）来管理 tun 模式的 root 后台守护。")
+
+
+def build_tun_config():
+    """用 config.json + tun-inbound.json 合成 config.tun.json，并校验。"""
+    require_config()
+    if not TUN_INBOUND.exists():
+        raise SbError(
+            f"找不到 tun 入站定义：{TUN_INBOUND}\n"
+            f"（默认配置不含 tun；该文件是拆分时抽出的 tun 块。）"
+        )
+    try:
+        tun_ib = json.loads(TUN_INBOUND.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise SbError(f"解析 {TUN_INBOUND} 失败：{e}")
+
+    data = load_config()
+    inbounds = [ib for ib in data.get("inbounds", []) if ib.get("type") != "tun"]
+    data["inbounds"] = [tun_ib] + inbounds
+    TUN_CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result = run(["sing-box", "check", "-c", str(TUN_CONFIG)], capture=True)
+    if result.returncode != 0:
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        raise SbError("tun 配置检查失败，未继续执行。")
+
+
+def write_daemon_plist():
+    """生成 daemon plist 并以 root:wheel 0644 安装到 /Library/LaunchDaemons。"""
+    sing_box = shutil.which("sing-box")
+    if not sing_box:
+        raise SbError("找不到 sing-box，请确认已 brew install sing-box。")
+
+    stdout_path, stderr_path = prepare_log_paths_for_launch("tun")
+
+    plist = {
+        "Label": DAEMON_LABEL,
+        "ProgramArguments": [sing_box, "run", "-c", str(TUN_CONFIG)],
+        "RunAtLoad": True,
+        # tun 是全局接管路由的"基础设施"，崩溃=整机断网，故自动重启
+        "KeepAlive": True,
+        "StandardOutPath": stdout_path,
+        "StandardErrorPath": stderr_path,
+        "WorkingDirectory": str(CONFIG_DIR),
+        "EnvironmentVariables": {
+            "PATH": os.environ.get(
+                "PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            )
+        },
+    }
+
+    tmp = CONFIG_DIR / (DAEMON_PLIST.name + ".tmp")
+    with tmp.open("wb") as f:
+        plistlib.dump(plist, f)
+
+    # launchd 要求 system 域的 plist 属于 root 且非组/他人可写
+    result = run(
+        ["sudo", "install", "-m", "644", "-o", "root", "-g", "wheel",
+         str(tmp), str(DAEMON_PLIST)],
+        capture=True,
+    )
+    tmp.unlink(missing_ok=True)
+    if result.returncode != 0:
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        raise SbError(f"安装 LaunchDaemon 失败：{DAEMON_PLIST}")
+    print(f"已写入 LaunchDaemon：{DAEMON_PLIST}")
+
+
+def daemon_bootout_quiet():
+    run(["sudo", "launchctl", "bootout", f"system/{DAEMON_LABEL}"], capture=True)
+
+
+def daemon_bootstrap():
+    result = run(["sudo", "launchctl", "bootstrap", "system", str(DAEMON_PLIST)], capture=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "already loaded" not in stderr.lower() and "Bootstrap failed: 5" not in stderr:
+            print(result.stdout, end="")
+            print(result.stderr, end="", file=sys.stderr)
+            raise SbError("sudo launchctl bootstrap system 失败。")
+
+
+def daemon_kickstart():
+    result = run(["sudo", "launchctl", "kickstart", "-k", f"system/{DAEMON_LABEL}"], capture=True)
+    if result.returncode != 0:
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        raise SbError("sudo launchctl kickstart 失败。")
+
+
+def start_tun():
+    """默认启动方式：tun 全局透明代理（root 守护，开机自启）。
+
+    所有程序（含不读系统代理的 Node 程序，如 Claude Code）都被 auto_route
+    全局接管，按 config.json 里的 route.rules 照常分流。
+    """
+    require_config()
+    killed = kill_other_proxies()
+    if killed:
+        print("已关闭其它科学上网工具：" + "、".join(killed))
+    # 先让出 7890 端口：mixed 在跑就先停（用户态，无需 sudo）；否则清掉系统代理
+    if proxy_running():
+        print("检测到 mixed 代理在运行，先停止它…")
+        stop_mixed()
+    else:
+        clear_all_proxies()  # tun 靠 auto_route 全局接管，不需要系统代理
+
+    sudo_prime()
+    build_tun_config()
+    write_daemon_plist()
+    daemon_bootout_quiet()
+    daemon_bootstrap()
+    daemon_kickstart()
+
+    if not wait_port():
+        print("警告：端口暂未就绪，tun 可能仍在启动或启动失败。可执行 sb log tail --tun 查看。",
+              file=sys.stderr)
+
+    set_tun_dns()  # 堵住 DNS 泄漏，保证 fake-ip 生效（详见 TUN_GUARD_DNS 注释）
+
+    print("sing-box tun 模式已启动（root 后台守护，开机自启）。")
+    status(quick=True)
+
+
+def tun_on():
+    start_tun()
+
+
+def stop_tun():
+    sudo_prime()
+    daemon_bootout_quiet()
+    if tun_running():
+        run(["sudo", "pkill", "-x", "sing-box"], capture=True)
+    restore_tun_dns()  # 还原启动前的系统 DNS
+    print("sing-box tun 模式已停止。")
+
+
+def tun_off():
+    stop_tun()
+
+
+def latest_run_dir(mode):
+    """某模式最近一次 run 目录：优先 latest 软链，否则取时间戳最大的子目录。"""
+    base = mode_log_root(mode)
+    link = base / "latest"
+    if link.is_symlink():
+        target = link.resolve()
+        if target.exists():
+            return target
+    if base.exists():
+        dirs = sorted(d for d in base.iterdir() if d.is_dir() and not d.is_symlink())
+        if dirs:
+            return dirs[-1]
+    return None
+
+
+def _show_run_logs(run_dir, label):
+    """tail -f 某 run 目录里有内容的日志（sing-box 主要写 stderr，优先它）。"""
+    if run_dir is None:
+        print(f"{label}还不存在（尚未以该模式启动过，或日志保存处于关闭状态）。")
+        return
+    err_log = run_dir / "sing-box.err.log"
+    out_log = run_dir / "sing-box.log"
+    existing = [p for p in (err_log, out_log) if p.exists()]
+    if not existing:
+        print(f"{label}目录暂无日志文件：{run_dir}")
+        return
+    for log_file in existing:
+        if log_file.stat().st_size > 0:
+            print(f"正在查看{label}：{log_file}")
+            subprocess.run(["tail", "-f", str(log_file)])
+            return
+    print(f"{label}当前为空，等待新日志：{existing[0]}")
+    subprocess.run(["tail", "-f", str(existing[0])])
+
+
+def logs_tun():
+    _show_run_logs(latest_run_dir("tun"), "tun 日志")
+
+
+def clean_proxy():
+    clear_all_proxies()
+    print("系统代理残留已清理。")
+
+
+def _dir_size(p):
+    total = 0
+    for f in p.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def clean_logs():
+    """清掉历史日志归档（tun/mixed 各时间戳目录），保留当前正在写的那次。"""
+    cur = load_state().get("current_log_dir") or ""
+    cur_path = Path(cur).resolve() if cur else None
+
+    removed, freed = 0, 0
+    for mode in LOG_MODES:
+        base = mode_log_root(mode)
+        if not base.exists():
+            continue
+        for d in list(base.iterdir()):
+            if d.is_symlink() or not d.is_dir():
+                continue
+            if cur_path and d.resolve() == cur_path:
+                continue  # 保留当前正在写入的 run 目录
+            freed += _dir_size(d)
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+        # latest 软链若已悬空则删掉
+        link = base / "latest"
+        if link.is_symlink() and not link.resolve().exists():
+            link.unlink(missing_ok=True)
+
+    print(f"已清理 {removed} 个历史日志目录，释放约 {_human_bytes(freed)}。")
+    if cur_path:
+        print(f"保留当前运行日志：{cur_path}")
+
+
+def status(quick=False):
+    print()
+    print("== sing-box ==")
+    procs = pgrep_singbox()
+    if procs:
+        print("进程：running")
+        print(procs)
+    else:
+        print("进程：stopped")
+
+    print(f"端口 {LISTEN_PORT}：{'listening' if is_port_listening() else 'not listening'}")
+    if quick:
+        # 启动刚结束时 Clash API(9090) 往往还没就绪，探测会白等满 2s 超时；
+        # 这里跳过它和运行时选择，避免拖慢 restart。完整状态用 `sb status` 查看。
+        api_up = False
+        print(f"Clash API {CLASH_PORT}：启动中（稍后用 sb status 查看）")
+    else:
+        api_up = clash_api_available()
+        print(f"Clash API {CLASH_PORT}：{'available' if api_up else 'not available'}")
+
+    if tun_running():
+        print("tun 模式：running（root 后台守护）")
+    elif DAEMON_PLIST.exists():
+        print("tun 模式：stopped（daemon 已安装，sb tun on 启动）")
+    else:
+        print("tun 模式：off（未安装；sb tun on 启用）")
+
+    print()
+    print("== 日志记录 ==")
+    if is_auto_log_enabled():
+        cur = load_state().get("current_log_dir") or ""
+        print("自动保存日志：开启（tun / mixed 统一归档）")
+        print(f"当前日志目录：{cur if cur else '(下次启动时生成)'}")
+        print("查看：sb log tail（当前模式最新） / sb log tail --tun（tun 最新）")
+    else:
+        print("自动保存日志：关闭（sb log on + sb restart 开启）")
+
+    print()
+    print("== 系统代理 ==")
+    for service in NETWORK_SERVICES:
+        print(f"{service}: {proxy_status(service)}")
+
+    print()
+    print("== 配置默认值 ==")
+    data = load_config()
+    for tag in WANTED_SELECTORS:
+        for outbound in data.get("outbounds", []):
+            if outbound.get("tag") == tag:
+                print(f"{tag}: {outbound.get('default', '(无 default)')}")
+                break
+
+    if api_up:
+        print()
+        print("== 运行时选择 ==")
+        selectors()
+
+
+def logs():
+    if not is_auto_log_enabled():
+        print("自动保存日志当前是关闭状态。")
+        print("需要实时日志请先执行：sb log on，然后 sb restart。")
+        return
+
+    # 优先看 state 记录的当前 run 目录；不可用时按在跑的模式取该模式最新
+    cur = load_state().get("current_log_dir") or ""
+    run_dir = Path(cur) if cur and Path(cur).exists() else None
+    if run_dir is None:
+        mode = "tun" if tun_running() else "mixed"
+        run_dir = latest_run_dir(mode)
+    _show_run_logs(run_dir, "日志")
+
+
+# ---------------------------------------------------------------------------
+# Clash API 命令
+# ---------------------------------------------------------------------------
+def api():
+    proxies = get_proxies()
+    print(f"Clash API 可用：{CLASH_API}")
+    print(f"proxies 数量：{len(proxies)}")
+
+
+def ui():
+    run(["open", f"{CLASH_API}/ui/"])
+
+
+def _human_bytes(n):
+    """字节数转可读字符串（B/KB/MB/GB/TB）。"""
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+
+
+def conns():
+    """抓取 Clash API 活动连接快照：存原始 json，并打印按下行排序的摘要。
+
+    用于网络分析——每条连接的目标域名 / 命中规则 / 出站节点 / 上下行流量。
+    """
+    try:
+        data = clash_request("GET", "/connections")
+    except Exception as e:
+        raise SbError(
+            f"Clash API /connections 请求失败：{CLASH_API}/connections\n错误：{e}\n"
+            f"请确认 sing-box 在运行。"
+        )
+
+    conn_list = (data or {}).get("connections") or []
+
+    CONNS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    snap = CONNS_DIR / f"{ts}.json"
+    snap.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    up = (data or {}).get("uploadTotal", 0)
+    down = (data or {}).get("downloadTotal", 0)
+    print(f"活动连接：{len(conn_list)}  累计 ↑{_human_bytes(up)} ↓{_human_bytes(down)}")
+    print(f"快照已存：{snap}")
+    if not conn_list:
+        return
+
+    rows = sorted(conn_list, key=lambda c: c.get("download", 0), reverse=True)
+    print()
+    for c in rows[:40]:
+        md = c.get("metadata", {})
+        host = md.get("host") or md.get("destinationIP") or "?"
+        dport = md.get("destinationPort", "")
+        target = f"{host}:{dport}" if dport else host
+
+        rule = c.get("rule", "")
+        payload = c.get("rulePayload", "")
+        rule_s = f"{rule}:{payload}" if payload else rule
+        # 精简超长规则（如 process_name 的进程列表）：保留 "类型 => 动作"，全文见 json
+        if len(rule_s) > 48 and "=>" in rule_s:
+            head = rule_s.split("=", 1)[0].strip()
+            action = rule_s.split("=>", 1)[1].strip()
+            rule_s = f"{head} => {action}"
+
+        chains = c.get("chains") or []
+        exit_node = chains[0] if chains else "?"  # chains[0] 是真正的出口节点
+
+        cu = _human_bytes(c.get("upload", 0))
+        cd = _human_bytes(c.get("download", 0))
+        print(f"  ↓{cd:>8} ↑{cu:>8}  {target}  [{rule_s}]  → {exit_node}")
+
+    if len(rows) > 40:
+        print(f"  … 其余 {len(rows) - 40} 条见快照文件")
+
+
+def selectors():
+    proxies = get_proxies()
+    for name in WANTED_SELECTORS:
+        p = proxies.get(name)
+        if not p:
+            print(f"{name}: API 中未找到")
+            continue
+        now = p.get("now", "(未知)")
+        all_nodes = p.get("all", [])
+        print(f"{name}: {now}")
+        if all_nodes:
+            tail = " ..." if len(all_nodes) > 8 else ""
+            print(f"  可选：{', '.join(all_nodes[:8])}{tail}")
+
+
+# Clash API 里属于「组」的类型
+_API_GROUP_TYPES = {"Selector", "URLTest", "Fallback", "LoadBalance"}
+
+
+def _node_delay(proxies, name):
+    """取某节点最近一次测速延迟(ms)：>0 返回数字，0 返回 0(超时)，无记录返回 None。"""
+    p = proxies.get(name)
+    if not p:
+        return None
+    hist = p.get("history") or []
+    if not hist:
+        return None
+    return hist[-1].get("delay")
+
+
+def _resolve_leaf(proxies, name, limit=10):
+    """沿 now 一路向下，找到真正的出口叶子节点(非组)。"""
+    seen = set()
+    cur = name
+    while (cur in proxies and proxies[cur].get("type") in _API_GROUP_TYPES
+           and cur not in seen and limit > 0):
+        seen.add(cur)
+        nxt = proxies[cur].get("now")
+        if not nxt or nxt == cur:
+            break
+        cur = nxt
+        limit -= 1
+    return cur
+
+
+def groups():
+    """显示所有策略组(selector/urltest)的实时情况。"""
+    data = load_config()
+    proxies = get_proxies()
+
+    group_tags = [o["tag"] for o in data.get("outbounds", [])
+                  if o.get("type") in ("selector", "urltest") and "tag" in o]
+    defaults = {o["tag"]: o.get("default") for o in data.get("outbounds", [])
+                if o.get("type") == "selector"}
+
+    print("== 策略组情况 ==")
+    for tag in group_tags:
+        p = proxies.get(tag)
+        if not p:
+            print(f"  {tag}: (运行时未找到，可能需要 sb restart)")
+            continue
+
+        ptype = p.get("type", "?")
+        now = p.get("now", "?")
+        leaf = _resolve_leaf(proxies, now)
+
+        line = f"  [{ptype:8}] {tag} → {now}"
+        if leaf != now:
+            line += f" → {leaf}"
+
+        delay = _node_delay(proxies, leaf)
+        if delay is None:
+            line += "  (未测)"
+        elif delay == 0:
+            line += "  (超时)"
+        else:
+            line += f"  ({delay}ms)"
+
+        d = defaults.get(tag)
+        if d and d != now:
+            line += f"   [默认 {d}]"
+
+        print(line)
+
+
+# ---------------------------------------------------------------------------
+# 运行时切换（不重启）
+# ---------------------------------------------------------------------------
+def _select_in_group(selector, target, missing_hint=None):
+    proxies = get_proxies()
+    if selector not in proxies:
+        raise SbError(f"Clash API 中找不到 selector：{selector}")
+    if target not in proxies[selector].get("all", []):
+        msg = f"{selector} 里找不到目标：{target}"
+        if missing_hint:
+            msg += "\n" + missing_hint
+        raise SbError(msg)
+    clash_select(selector, target)
+
+
+def list_group_nodes(selector, label=None):
+    """打印某策略组的全部候选节点：编号 + ★当前 + 延迟（顶层组顺带显真实出口）。"""
+    label = label or selector
+    proxies = get_proxies()
+    p = proxies.get(selector)
+    if not p:
+        raise SbError(f"Clash API 中找不到策略组：{selector}（可能需要 sb restart）")
+    now = p.get("now")
+    all_nodes = p.get("all", [])
+    print(f"== {label} 组（{len(all_nodes)} 个；★=当前；编号用于 sb use {label} N）==")
+    for i, name in enumerate(all_nodes, 1):
+        mark = "★" if name == now else " "
+        leaf = _resolve_leaf(proxies, name)
+        delay = _node_delay(proxies, leaf)
+        d = "未测" if delay is None else ("超时" if delay == 0 else f"{delay}ms")
+        line = f" {mark} {i:2}. {name}"
+        if leaf != name:
+            line += f" → {leaf}"
+        print(f"{line}  ({d})")
+
+
+def _resolve_arg_to_target(selector, arg):
+    """把 list/auto/数字/名字 解析成要切换的目标节点名。
+    list（含空参）时打印列表并返回 None。"""
+    proxies = get_proxies()
+    p = proxies.get(selector)
+    if not p:
+        raise SbError(f"Clash API 中找不到策略组：{selector}（可能需要 sb restart）")
+    all_nodes = p.get("all", [])
+    s = str(arg).strip()
+    low = s.lower()
+    if low in ("list", "ls", ""):
+        list_group_nodes(selector)
+        return None
+    if s.isdigit():
+        idx = int(s)
+        if not (1 <= idx <= len(all_nodes)):
+            raise SbError(
+                f"{selector} 共 {len(all_nodes)} 个节点，编号需在 1-{len(all_nodes)}；"
+                f"先 sb use {selector} list 看看。")
+        return all_nodes[idx - 1]
+    if low == "auto":
+        autos = [n for n in all_nodes if n.endswith("-auto")]
+        if not autos:
+            raise SbError(f"{selector} 没有自动测速(auto)成员，请用编号或名字选。")
+        return autos[0]
+    if s in all_nodes:
+        return s
+    raise SbError(f"{selector} 里找不到：{s}\n用 sb use {selector} list 看可选编号/名字。")
+
+
+def use_group(selector, arg):
+    """统一的运行时切换：list 看节点，数字按编号切，auto/名字也支持。"""
+    target = _resolve_arg_to_target(selector, arg)
+    if target is None:
+        return
+    _select_in_group(selector, target)
+
+
+def use_main_group(arg):
+    """对 youtube/google/github/telegram 四组统一操作（成员一致）。"""
+    head = SERVICE_SELECTORS[MAIN_SERVICES[0]]
+    if str(arg).strip().lower() in ("list", "ls", ""):
+        list_group_nodes(head, label="main")
+        return
+    target = _resolve_arg_to_target(head, arg)
+    if target is None:
+        return
+    for service in MAIN_SERVICES:
+        _select_in_group(SERVICE_SELECTORS[service], target)
+
+
+# ---------------------------------------------------------------------------
+# 修改选择器默认值（写入 config；重启后以新默认为准）
+# ---------------------------------------------------------------------------
+def _set_selector_default(data, selector, target):
+    """把 data 里某 selector 的 default 设为 target；返回是否有改动。"""
+    for ob in data.get("outbounds", []):
+        if ob.get("tag") == selector and ob.get("type") == "selector":
+            if target not in ob.get("outbounds", []):
+                raise SbError(
+                    f"{selector} 的候选里没有 {target}；"
+                    f"可选：{', '.join(ob.get('outbounds', []))}"
+                )
+            if ob.get("default") == target:
+                return False
+            ob["default"] = target
+            return True
+    raise SbError(f"配置里找不到选择器：{selector}")
+
+
+def _config_selector(data, selector):
+    """从 config.json 取某 selector 的 outbound 对象。"""
+    for ob in data.get("outbounds", []):
+        if ob.get("tag") == selector and ob.get("type") == "selector":
+            return ob
+    raise SbError(f"config.json 里找不到选择器：{selector}")
+
+
+def _route_list(data, selector, label=None):
+    """打印某 selector 的候选成员（编号 + ★当前默认）。基于 config.json，不需 sing-box 在跑。"""
+    label = label or selector
+    ob = _config_selector(data, selector)
+    members = ob.get("outbounds", [])
+    default = ob.get("default")
+    print(f"== {label} 默认值候选（{len(members)} 个；★=当前默认；编号用于 sb set {label} N）==")
+    for i, m in enumerate(members, 1):
+        mark = "★" if m == default else " "
+        print(f" {mark} {i:2}. {m}")
+
+
+def _resolve_route_arg(data, selector, arg):
+    """list/编号/auto/名字 -> 目标成员名；list（含空参）打印并返回 None。基于 config.json 成员。"""
+    ob = _config_selector(data, selector)
+    members = ob.get("outbounds", [])
+    s = str(arg).strip()
+    low = s.lower()
+    if low in ("list", "ls", ""):
+        _route_list(data, selector)
+        return None
+    if s.isdigit():
+        idx = int(s)
+        if not (1 <= idx <= len(members)):
+            raise SbError(
+                f"{selector} 共 {len(members)} 个候选，编号需在 1-{len(members)}；"
+                f"先 sb set {selector} list 看看。")
+        return members[idx - 1]
+    if low == "auto":
+        autos = [m for m in members if m.endswith("-auto")]
+        if not autos:
+            raise SbError(f"{selector} 没有自动测速(auto)候选，请用编号或名字。")
+        return autos[0]
+    if s in members:
+        return s
+    raise SbError(f"{selector} 候选里没有：{s}\n用 sb set {selector} list 看可选编号/名字。")
+
+
+def route_group(selector, arg):
+    """写持久默认值：list 看候选，数字按编号，auto/名字也支持。重启后以此为准。"""
+    data = load_config()
+    target = _resolve_route_arg(data, selector, arg)
+    if target is None:
+        return
+    if not _set_selector_default(data, selector, target):
+        print(f"{selector} 默认值已是 {target}，无需修改。")
+        return
+    save_config(data)
+    check_config()
+    print(f"已修改默认值：{selector} -> {target}")
+    print(f"重启后以此默认为准；本次运行可即时切换：sb use {selector} {arg}")
+
+
+def route_main_group(arg):
+    """对 youtube/google/github/telegram 四组统一写默认值（成员一致）。"""
+    data = load_config()
+    head = SERVICE_SELECTORS[MAIN_SERVICES[0]]
+    if str(arg).strip().lower() in ("list", "ls", ""):
+        _route_list(data, head, label="main")
+        return
+    target = _resolve_route_arg(data, head, arg)
+    if target is None:
+        return
+    changed = 0
+    for service in MAIN_SERVICES:
+        if _set_selector_default(data, SERVICE_SELECTORS[service], target):
+            changed += 1
+    if changed == 0:
+        print(f"YouTube / Google / GitHub / Telegram 默认值已都是 {target}，无需修改。")
+        return
+    save_config(data)
+    check_config()
+    print(f"已修改默认值：YouTube / Google / GitHub / Telegram -> {target}（{changed} 个）")
+    print(f"重启后以此默认为准；本次运行可即时切换：sb use main {arg}")
+
+
+# ---------------------------------------------------------------------------
+# 测试
+# ---------------------------------------------------------------------------
+def curl(url, max_time=30):
+    cmd = [
+        "curl", "--http1.1", "-L",
+        "-x", f"http://{LISTEN_HOST}:{LISTEN_PORT}",
+        url, "-o", "/dev/null",
+        "-w", "%{http_code}\\n",
+        "--max-time", str(max_time),
+    ]
+    return run(cmd)
+
+
+def test_main():
+    print("YouTube:")
+    curl("https://www.youtube.com/", max_time=30)
+    print("GitHub:")
+    curl("https://github.com/", max_time=30)
+    print("Google:")
+    curl("https://www.google.com/", max_time=30)
+
+
+def test_ai():
+    print("ChatGPT: 403 也表示已到达 Cloudflare，浏览器可打开为准")
+    curl("https://chatgpt.com/", max_time=30)
+    print("Claude: 403 也可能是正常 challenge")
+    curl("https://claude.ai/", max_time=30)
+
+
+def test_cn():
+    print("Baidu:")
+    curl("https://www.baidu.com/", max_time=20)
+    print("Doubao:")
+    curl("https://www.doubao.com/", max_time=20)
+
+
+def test_proxy():
+    print("代理出口 IP:")
+    cmd = [
+        "curl", "--http1.1",
+        "-x", f"http://{LISTEN_HOST}:{LISTEN_PORT}",
+        "https://ip.sb", "--max-time", "20",
+    ]
+    run(cmd)
+
+
+def test_all():
+    test_main()
+    test_ai()
+    test_cn()
+    test_proxy()
+
+
+# ---------------------------------------------------------------------------
+# 日志开关
+# ---------------------------------------------------------------------------
+def log_on():
+    state = load_state()
+    state["auto_save_logs"] = True
+    save_state(state)
+    print("已开启自动保存日志（tun / mixed 统一）。")
+    print("下次 sb start / sb restart 后，将按模式自动保存到：")
+    print(f"  {DIAG_DIR}/<tun|mixed>/<时间戳>/")
+    print("建议现在执行：sb restart")
+
+
+def log_off():
+    state = load_state()
+    state["auto_save_logs"] = False
+    state["current_log_dir"] = ""
+    save_state(state)
+    print("已关闭自动保存日志。")
+    print("下次 sb start / sb restart 后，后台日志将写入 /dev/null。")
+    print("建议现在执行：sb restart")
+
+
+def log_status():
+    state = load_state()
+    enabled = bool(state.get("auto_save_logs"))
+    print(f"自动保存日志：{'开启' if enabled else '关闭'}")
+    current_dir = state.get("current_log_dir") or ""
+    print(f"当前运行日志目录：{current_dir if current_dir else '无'}")
+    print(f"日志归档根目录：{DIAG_DIR}（按 tun / mixed 分目录；不自动清理，sb log clean 手动清）")
+
+
+# ---------------------------------------------------------------------------
+# 订阅解析：从机场订阅（Clash/Mihomo YAML、Loon/Surge INI、Shadowrocket/通用
+# base64、明文 URI 列表）里只提取节点，转成 sing-box 出站 JSON。忽略规则/策略组。
+# 支持协议：ss(含 obfs/v2ray-plugin)、vmess、vless(含 reality)、trojan、
+# hysteria2、tuic、socks、http；不支持的（ssr/snell 等）跳过并计数。
+# ---------------------------------------------------------------------------
+SUB_OUT = CONFIG_DIR / "subscription-nodes.json"
+
+
+def _b64decode_text(s):
+    """宽松 base64 解码为文本（兼容 urlsafe、缺省 padding）；失败返回 None。"""
+    s = re.sub(r"\s", "", s).replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    try:
+        return base64.b64decode(s).decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def _looks_base64(s):
+    s2 = re.sub(r"\s", "", s)
+    return bool(s2) and re.fullmatch(r"[A-Za-z0-9+/=_\-]+", s2) is not None
+
+
+def _split_host_port(s):
+    s = s.strip()
+    if s.startswith("["):
+        host, _, port = s[1:].partition("]:")
+    else:
+        host, _, port = s.rpartition(":")
+    try:
+        return host, int(port)
+    except (ValueError, TypeError):
+        return host, None
+
+
+def _qs(query):
+    return {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+
+
+def _transport(net, path=None, host=None, service=None):
+    net = (net or "tcp").lower()
+    if net in ("ws", "websocket"):
+        tr = {"type": "ws"}
+        if path:
+            tr["path"] = path
+        if host:
+            tr["headers"] = {"Host": host}
+        return tr
+    if net == "grpc":
+        return {"type": "grpc", "service_name": service or ""}
+    if net in ("h2", "http"):
+        tr = {"type": "http"}
+        if host:
+            tr["host"] = [host]
+        if path:
+            tr["path"] = path
+        return tr
+    if net == "httpupgrade":
+        tr = {"type": "httpupgrade"}
+        if path:
+            tr["path"] = path
+        if host:
+            tr["host"] = host
+        return tr
+    return None
+
+
+# ----- URI 协议（Shadowrocket / 通用 base64 / v2rayN）-----
+def _u_ss(uri):
+    body = uri[5:]
+    name = ""
+    if "#" in body:
+        body, frag = body.split("#", 1)
+        name = urllib.parse.unquote(frag)
+    plugin = plugin_opts = None
+    if "?" in body:
+        body, query = body.split("?", 1)
+        plug = urllib.parse.unquote(_qs(query).get("plugin", ""))
+        if plug:
+            parts = plug.split(";")
+            plugin, plugin_opts = parts[0], ";".join(parts[1:])
+    if "@" in body:
+        userinfo, server = body.rsplit("@", 1)
+        dec = _b64decode_text(userinfo) or urllib.parse.unquote(userinfo)
+        method, _, password = dec.partition(":")
+        host, port = _split_host_port(server)
+    else:
+        dec = _b64decode_text(body) or ""
+        creds, _, server = dec.rpartition("@")
+        method, _, password = creds.partition(":")
+        host, port = _split_host_port(server)
+    ob = {"type": "shadowsocks", "tag": name or f"{host}:{port}", "server": host,
+          "server_port": port, "method": method, "password": password}
+    if plugin in ("obfs-local", "simple-obfs"):
+        ob["plugin"] = "obfs-local"
+        ob["plugin_opts"] = plugin_opts or ""
+    elif plugin == "v2ray-plugin":
+        ob["plugin"] = "v2ray-plugin"
+        ob["plugin_opts"] = plugin_opts or ""
+    return ob
+
+
+def _u_vmess(uri):
+    j = json.loads(_b64decode_text(uri[8:]) or "{}")
+    host = j.get("add")
+    port = int(j.get("port", 0) or 0)
+    ob = {"type": "vmess", "tag": j.get("ps") or f"{host}:{port}", "server": host,
+          "server_port": port, "uuid": j.get("id"), "alter_id": int(j.get("aid", 0) or 0),
+          "security": j.get("scy") or "auto"}
+    if (j.get("tls") or "") in ("tls", "reality", "xtls"):
+        t = {"enabled": True}
+        sni = j.get("sni") or j.get("host")
+        if sni:
+            t["server_name"] = sni
+        ob["tls"] = t
+    tr = _transport(j.get("net"), path=j.get("path"), host=j.get("host"),
+                    service=j.get("path") or j.get("host"))
+    if tr:
+        ob["transport"] = tr
+    return ob
+
+
+def _u_vless(uri):
+    u = urllib.parse.urlparse(uri)
+    q = _qs(u.query)
+    host, port = u.hostname, u.port
+    name = urllib.parse.unquote(u.fragment) if u.fragment else f"{host}:{port}"
+    ob = {"type": "vless", "tag": name, "server": host, "server_port": port, "uuid": u.username}
+    if q.get("flow"):
+        ob["flow"] = q["flow"]
+    sec = q.get("security", "")
+    if sec in ("tls", "reality", "xtls"):
+        t = {"enabled": True}
+        if q.get("sni"):
+            t["server_name"] = q["sni"]
+        if sec == "reality":
+            r = {"enabled": True}
+            if q.get("pbk"):
+                r["public_key"] = q["pbk"]
+            if q.get("sid"):
+                r["short_id"] = q["sid"]
+            t["reality"] = r
+            t["utls"] = {"enabled": True, "fingerprint": q.get("fp") or "chrome"}
+        elif q.get("fp"):
+            t["utls"] = {"enabled": True, "fingerprint": q["fp"]}
+        ob["tls"] = t
+    tr = _transport(q.get("type"), path=q.get("path"), host=q.get("host"), service=q.get("serviceName"))
+    if tr:
+        ob["transport"] = tr
+    return ob
+
+
+def _u_trojan(uri):
+    u = urllib.parse.urlparse(uri)
+    q = _qs(u.query)
+    host, port = u.hostname, u.port
+    name = urllib.parse.unquote(u.fragment) if u.fragment else f"{host}:{port}"
+    ob = {"type": "trojan", "tag": name, "server": host, "server_port": port,
+          "password": urllib.parse.unquote(u.username or "")}
+    t = {"enabled": True}
+    sni = q.get("sni") or q.get("peer")
+    if sni:
+        t["server_name"] = sni
+    if q.get("fp"):
+        t["utls"] = {"enabled": True, "fingerprint": q["fp"]}
+    if q.get("allowInsecure") in ("1", "true"):
+        t["insecure"] = True
+    ob["tls"] = t
+    tr = _transport(q.get("type"), path=q.get("path"), host=q.get("host"), service=q.get("serviceName"))
+    if tr:
+        ob["transport"] = tr
+    return ob
+
+
+def _u_hy2(uri):
+    u = urllib.parse.urlparse(uri)
+    q = _qs(u.query)
+    host, port = u.hostname, (u.port or 443)
+    name = urllib.parse.unquote(u.fragment) if u.fragment else f"{host}:{port}"
+    ob = {"type": "hysteria2", "tag": name, "server": host, "server_port": port,
+          "password": urllib.parse.unquote(u.username or "")}
+    t = {"enabled": True}
+    if q.get("sni"):
+        t["server_name"] = q["sni"]
+    if q.get("insecure") in ("1", "true"):
+        t["insecure"] = True
+    ob["tls"] = t
+    if q.get("obfs"):
+        ob["obfs"] = {"type": q["obfs"], "password": q.get("obfs-password", "")}
+    return ob
+
+
+def _u_tuic(uri):
+    u = urllib.parse.urlparse(uri)
+    q = _qs(u.query)
+    host, port = u.hostname, (u.port or 443)
+    name = urllib.parse.unquote(u.fragment) if u.fragment else f"{host}:{port}"
+    ob = {"type": "tuic", "tag": name, "server": host, "server_port": port,
+          "uuid": u.username or "", "password": urllib.parse.unquote(u.password or "")}
+    t = {"enabled": True}
+    if q.get("sni"):
+        t["server_name"] = q["sni"]
+    if q.get("alpn"):
+        t["alpn"] = q["alpn"].split(",")
+    ob["tls"] = t
+    if q.get("congestion_control"):
+        ob["congestion_control"] = q["congestion_control"]
+    return ob
+
+
+def _u_socks(uri):
+    u = urllib.parse.urlparse(uri)
+    host, port = u.hostname, u.port
+    name = urllib.parse.unquote(u.fragment) if u.fragment else f"{host}:{port}"
+    ob = {"type": "socks", "tag": name, "server": host, "server_port": port}
+    if u.username:
+        ob["username"] = urllib.parse.unquote(u.username)
+    if u.password:
+        ob["password"] = urllib.parse.unquote(u.password)
+    return ob
+
+
+_URI_PARSERS = {"ss": _u_ss, "vmess": _u_vmess, "vless": _u_vless, "trojan": _u_trojan,
+                "hysteria2": _u_hy2, "hy2": _u_hy2, "tuic": _u_tuic,
+                "socks": _u_socks, "socks5": _u_socks}
+
+
+def _parse_uri_list(text):
+    nodes, skipped = [], []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "://" not in line:
+            continue
+        scheme = line.split("://", 1)[0].lower()
+        fn = _URI_PARSERS.get(scheme)
+        ob = None
+        if fn:
+            try:
+                ob = fn(line)
+            except Exception:
+                ob = None
+        if ob and ob.get("server"):
+            nodes.append(ob)
+        else:
+            skipped.append(scheme)
+    return nodes, skipped
+
+
+# ----- 轻量 YAML（仅够解析 Clash proxies；环境无 PyYAML）-----
+def _yaml_scalar(s):
+    s = s.strip()
+    if s == "":
+        return None
+    if s[0] in "[{":
+        return _parse_flow(s)
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    low = s.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
+    return s
+
+
+def _read_flow_scalar(s, i, stop):
+    if i < len(s) and s[i] in "\"'":
+        q = s[i]
+        i += 1
+        start = i
+        while i < len(s) and s[i] != q:
+            i += 1
+        return s[start:i], i + 1
+    start = i
+    while i < len(s) and s[i] not in stop:
+        i += 1
+    return s[start:i], i
+
+
+def _parse_flow_at(s, i):
+    while i < len(s) and s[i] == " ":
+        i += 1
+    if i < len(s) and s[i] == "{":
+        d = {}
+        i += 1
+        while i < len(s):
+            while i < len(s) and s[i] in " ,":
+                i += 1
+            if i < len(s) and s[i] == "}":
+                return d, i + 1
+            key, i = _read_flow_scalar(s, i, ":")
+            while i < len(s) and s[i] in " :":
+                i += 1
+            val, i = _parse_flow_at(s, i)
+            d[key.strip()] = val
+        return d, i
+    if i < len(s) and s[i] == "[":
+        arr = []
+        i += 1
+        while i < len(s):
+            while i < len(s) and s[i] in " ,":
+                i += 1
+            if i < len(s) and s[i] == "]":
+                return arr, i + 1
+            val, i = _parse_flow_at(s, i)
+            arr.append(val)
+        return arr, i
+    raw, i = _read_flow_scalar(s, i, ",}]")
+    return _yaml_scalar(raw), i
+
+
+def _parse_flow(s):
+    val, _ = _parse_flow_at(s.strip(), 0)
+    return val
+
+
+def _tokenize_yaml(text):
+    toks = []
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        toks.append((indent, raw.strip()))
+    return toks
+
+
+def _parse_block(toks, i, indent):
+    first = toks[i][1]
+    if first == "-" or first.startswith("- "):
+        seq = []
+        while i < len(toks) and toks[i][0] == indent and (toks[i][1] == "-" or toks[i][1].startswith("- ")):
+            content = toks[i][1][1:].strip()
+            if content == "":
+                i += 1
+                if i < len(toks) and toks[i][0] > indent:
+                    val, i = _parse_block(toks, i, toks[i][0])
+                else:
+                    val = None
+                seq.append(val)
+            elif content[0] in "[{":
+                seq.append(_parse_flow(content))
+                i += 1
+            elif ":" in content:
+                child = indent + 2
+                d = {}
+                key, _, rest = content.partition(":")
+                d[key.strip().strip("\"'")] = _yaml_scalar(rest.strip())
+                i += 1
+                while (i < len(toks) and toks[i][0] == child
+                       and not (toks[i][1] == "-" or toks[i][1].startswith("- "))):
+                    k2, _, r2 = toks[i][1].partition(":")
+                    if r2.strip() == "":
+                        i += 1
+                        if i < len(toks) and toks[i][0] > child:
+                            sub, i = _parse_block(toks, i, toks[i][0])
+                        else:
+                            sub = None
+                        d[k2.strip().strip("\"'")] = sub
+                    else:
+                        d[k2.strip().strip("\"'")] = _yaml_scalar(r2.strip())
+                        i += 1
+                seq.append(d)
+            else:
+                seq.append(_yaml_scalar(content))
+                i += 1
+        return seq, i
+    d = {}
+    while i < len(toks) and toks[i][0] == indent and not (toks[i][1] == "-" or toks[i][1].startswith("- ")):
+        key, _, rest = toks[i][1].partition(":")
+        key = key.strip().strip("\"'")
+        if rest.strip() == "":
+            i += 1
+            if i < len(toks) and toks[i][0] > indent:
+                val, i = _parse_block(toks, i, toks[i][0])
+            else:
+                val = None
+            d[key] = val
+        else:
+            d[key] = _yaml_scalar(rest.strip())
+            i += 1
+    return d, i
+
+
+def _mini_yaml(text):
+    toks = _tokenize_yaml(text)
+    if not toks:
+        return {}
+    obj, _ = _parse_block(toks, 0, toks[0][0])
+    return obj
+
+
+def _clash_to_outbound(p):
+    t = (p.get("type") or "").lower()
+    name = p.get("name") or f"{p.get('server')}:{p.get('port')}"
+    server = p.get("server")
+    port = int(p.get("port") or 0)
+    base = {"tag": name, "server": server, "server_port": port}
+    net = (p.get("network") or "tcp").lower()
+
+    def tls_block(default_sni=None):
+        tls = {"enabled": True}
+        sni = p.get("sni") or p.get("servername") or p.get("server-name") or default_sni
+        if sni:
+            tls["server_name"] = sni
+        if p.get("skip-cert-verify"):
+            tls["insecure"] = True
+        alpn = p.get("alpn")
+        if alpn:
+            tls["alpn"] = alpn if isinstance(alpn, list) else [alpn]
+        return tls
+
+    def transport():
+        if net == "ws":
+            wo = p.get("ws-opts") or {}
+            tr = {"type": "ws"}
+            path = wo.get("path") or p.get("ws-path")
+            if path:
+                tr["path"] = path
+            headers = wo.get("headers") or {}
+            host = headers.get("Host") or headers.get("host")
+            if host:
+                tr["headers"] = {"Host": host}
+            return tr
+        if net == "grpc":
+            go = p.get("grpc-opts") or {}
+            return {"type": "grpc", "service_name": go.get("grpc-service-name", "")}
+        if net in ("h2", "http"):
+            ho = p.get("h2-opts") or p.get("http-opts") or {}
+            tr = {"type": "http"}
+            hosts = ho.get("host")
+            if hosts:
+                tr["host"] = hosts if isinstance(hosts, list) else [hosts]
+            path = ho.get("path")
+            if path:
+                tr["path"] = path if isinstance(path, str) else path[0]
+            return tr
+        return None
+
+    if t == "ss":
+        ob = {"type": "shadowsocks", **base, "method": p.get("cipher"), "password": p.get("password")}
+        plugin = p.get("plugin")
+        po = p.get("plugin-opts") or {}
+        if plugin in ("obfs", "obfs-local", "simple-obfs"):
+            opts = f"obfs={po.get('mode', 'http')}"
+            if po.get("host"):
+                opts += f";obfs-host={po['host']}"
+            ob["plugin"] = "obfs-local"
+            ob["plugin_opts"] = opts
+        elif plugin == "v2ray-plugin":
+            opts = "mode=websocket"
+            if po.get("host"):
+                opts += f";host={po['host']}"
+            if po.get("path"):
+                opts += f";path={po['path']}"
+            if po.get("tls"):
+                opts += ";tls"
+            ob["plugin"] = "v2ray-plugin"
+            ob["plugin_opts"] = opts
+        return ob
+    if t == "vmess":
+        ob = {"type": "vmess", **base, "uuid": p.get("uuid"),
+              "alter_id": int(p.get("alterId", 0) or 0), "security": p.get("cipher") or "auto"}
+        if p.get("tls"):
+            ob["tls"] = tls_block(default_sni=server)
+        tr = transport()
+        if tr:
+            ob["transport"] = tr
+        return ob
+    if t == "vless":
+        ob = {"type": "vless", **base, "uuid": p.get("uuid")}
+        if p.get("flow"):
+            ob["flow"] = p["flow"]
+        if p.get("tls"):
+            tls = tls_block(default_sni=server)
+            ro = p.get("reality-opts")
+            fp = p.get("client-fingerprint")
+            if ro:
+                tls["reality"] = {"enabled": True, "public_key": ro.get("public-key", ""),
+                                  "short_id": ro.get("short-id", "")}
+                tls["utls"] = {"enabled": True, "fingerprint": fp or "chrome"}
+            elif fp:
+                tls["utls"] = {"enabled": True, "fingerprint": fp}
+            ob["tls"] = tls
+        tr = transport()
+        if tr:
+            ob["transport"] = tr
+        return ob
+    if t == "trojan":
+        ob = {"type": "trojan", **base, "password": p.get("password"), "tls": tls_block(default_sni=server)}
+        tr = transport()
+        if tr:
+            ob["transport"] = tr
+        return ob
+    if t in ("hysteria2", "hy2"):
+        ob = {"type": "hysteria2", **base, "password": p.get("password") or p.get("auth"),
+              "tls": tls_block(default_sni=server)}
+        if p.get("obfs"):
+            ob["obfs"] = {"type": p["obfs"], "password": p.get("obfs-password", "")}
+        return ob
+    if t == "tuic":
+        ob = {"type": "tuic", **base, "uuid": p.get("uuid"), "password": p.get("password"),
+              "tls": tls_block(default_sni=server)}
+        if p.get("congestion-controller"):
+            ob["congestion_control"] = p["congestion-controller"]
+        return ob
+    if t in ("socks5", "socks"):
+        ob = {"type": "socks", **base}
+        if p.get("username"):
+            ob["username"] = p["username"]
+        if p.get("password"):
+            ob["password"] = p["password"]
+        return ob
+    if t in ("http", "https"):
+        ob = {"type": "http", **base}
+        if p.get("username"):
+            ob["username"] = p["username"]
+        if p.get("password"):
+            ob["password"] = p["password"]
+        return ob
+    return None
+
+
+def _parse_clash(text):
+    obj = _mini_yaml(text)
+    proxies = obj.get("proxies") if isinstance(obj, dict) else None
+    nodes, skipped = [], []
+    for p in proxies or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            ob = _clash_to_outbound(p)
+        except Exception:
+            ob = None
+        if ob and ob.get("server"):
+            nodes.append(ob)
+        else:
+            skipped.append(p.get("type") or "?")
+    return nodes, skipped
+
+
+# ----- Loon / Surge INI -----
+def _split_csv(s):
+    out, cur, q = [], "", None
+    for ch in s:
+        if q:
+            cur += ch
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+            cur += ch
+        elif ch == ",":
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    return out
+
+
+def _loon_to_outbound(name, typ, parts, kv):
+    server = parts[1] if len(parts) > 1 else None
+    port = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+    base = {"tag": name, "server": server, "server_port": port}
+    if typ in ("shadowsocks", "ss"):
+        return {"type": "shadowsocks", **base,
+                "method": parts[3] if len(parts) > 3 else kv.get("encrypt-method"),
+                "password": (parts[4].strip('"') if len(parts) > 4 else kv.get("password"))}
+    if typ == "trojan":
+        ob = {"type": "trojan", **base,
+              "password": parts[3].strip('"') if len(parts) > 3 else kv.get("password")}
+        t = {"enabled": True}
+        if kv.get("sni") or kv.get("tls-name"):
+            t["server_name"] = kv.get("sni") or kv.get("tls-name")
+        if kv.get("skip-cert-verify") == "true":
+            t["insecure"] = True
+        ob["tls"] = t
+        return ob
+    if typ == "vmess":
+        ob = {"type": "vmess", **base,
+              "uuid": kv.get("uuid") or (parts[4].strip('"') if len(parts) > 4 else None),
+              "alter_id": int(kv.get("alterid", 0) or 0),
+              "security": parts[3] if len(parts) > 3 else "auto"}
+        if kv.get("over-tls") == "true" or kv.get("tls") == "true":
+            t = {"enabled": True}
+            if kv.get("tls-name") or kv.get("sni"):
+                t["server_name"] = kv.get("tls-name") or kv.get("sni")
+            ob["tls"] = t
+        if kv.get("transport") == "ws":
+            tr = {"type": "ws"}
+            if kv.get("path"):
+                tr["path"] = kv["path"]
+            if kv.get("host"):
+                tr["headers"] = {"Host": kv["host"]}
+            ob["transport"] = tr
+        return ob
+    if typ == "vless":
+        ob = {"type": "vless", **base, "uuid": kv.get("uuid")}
+        if kv.get("over-tls") == "true" or kv.get("tls") == "true":
+            t = {"enabled": True}
+            if kv.get("tls-name") or kv.get("sni"):
+                t["server_name"] = kv.get("tls-name") or kv.get("sni")
+            ob["tls"] = t
+        return ob
+    return None
+
+
+def _parse_loon(text):
+    nodes, skipped = [], []
+    in_proxy = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";", "//")):
+            continue
+        if line.startswith("["):
+            in_proxy = line.lower() == "[proxy]"
+            continue
+        if not in_proxy or "=" not in line:
+            continue
+        name, _, rhs = line.partition("=")
+        name = name.strip()
+        parts = [x.strip() for x in _split_csv(rhs)]
+        if len(parts) < 3:
+            continue
+        typ = parts[0].lower()
+        kv = {}
+        for seg in parts:
+            if "=" in seg:
+                k, _, v = seg.partition("=")
+                kv[k.strip().lower()] = v.strip().strip('"')
+        try:
+            ob = _loon_to_outbound(name, typ, parts, kv)
+        except Exception:
+            ob = None
+        if ob and ob.get("server"):
+            nodes.append(ob)
+        else:
+            skipped.append(typ)
+    return nodes, skipped
+
+
+def _extract_nodes(content):
+    """识别订阅格式并提取节点，返回 (格式名, (nodes, skipped))。"""
+    c = content.strip()
+    if _looks_base64(c):
+        dec = _b64decode_text(c)
+        if dec and "://" in dec:
+            return "通用/Shadowrocket(base64)", _parse_uri_list(dec)
+    if "proxies:" in c:
+        return "Clash/Mihomo(YAML)", _parse_clash(c)
+    if re.search(r"^\s*\[proxy\]", c, re.I | re.M):
+        return "Loon/Surge(INI)", _parse_loon(c)
+    if "://" in c:
+        return "明文 URI 列表", _parse_uri_list(c)
+    raise SbError("无法识别的订阅格式（既不是 base64/Clash/Loon，也没有 URI）。")
+
+
+def _fetch_sub(source):
+    """订阅来源：本地文件 / http(s) URL / 直接的原始内容。"""
+    p = Path(source).expanduser()
+    if p.exists():
+        return p.read_text(encoding="utf-8", errors="replace")
+    if source.startswith(("http://", "https://")):
+        cmd = ["curl", "-fsSL", "--connect-timeout", "15", "--max-time", "45",
+               "-A", "clash-verge/v2.0.0", "--retry", "2"]
+        if is_port_listening():
+            cmd += ["-x", f"http://{LISTEN_HOST}:{LISTEN_PORT}"]
+        cmd += [source]
+        r = run(cmd, capture=True)
+        if r.returncode != 0 or not r.stdout.strip():
+            raise SbError(f"订阅下载失败：{source}\n{r.stderr.strip()}")
+        return r.stdout
+    return source
+
+
+def _dedupe_tags(nodes):
+    """同名 tag 自动加后缀，保证唯一（并入 config 时不会冲突）。"""
+    seen = set()
+    for n in nodes:
+        tag = n["tag"]
+        if tag in seen:
+            k = 2
+            while f"{tag} #{k}" in seen:
+                k += 1
+            tag = f"{tag} #{k}"
+            n["tag"] = tag
+        seen.add(tag)
+    return nodes
+
+
+def _print_sub_result(fmt, nodes, skipped):
+    print(f"订阅格式：{fmt}")
+    line = f"提取节点：{len(nodes)} 个"
+    if skipped:
+        line += f"；跳过(不支持) {len(skipped)} 个：{', '.join(sorted(set(skipped)))}"
+    print(line)
+    if nodes:
+        dist = {}
+        for n in nodes:
+            dist[n["type"]] = dist.get(n["type"], 0) + 1
+        print("类型分布：" + ", ".join(f"{k}×{v}" for k, v in sorted(dist.items())))
+        print()
+        for n in nodes:
+            extra = []
+            if n.get("tls"):
+                extra.append("tls")
+            if n.get("transport"):
+                extra.append(n["transport"]["type"])
+            suffix = f"  ({', '.join(extra)})" if extra else ""
+            print(f"  [{n['type']:11}] {n['tag']}  →  {n['server']}:{n['server_port']}{suffix}")
+
+
+def parse_sub(source, outpath=None):
+    """一次性解析（不入库），写出 sing-box 出站 JSON。入库管理见 sb sub add。"""
+    fmt, (nodes, skipped) = _extract_nodes(_fetch_sub(source))
+    _dedupe_tags(nodes)
+    _print_sub_result(fmt, nodes, skipped)
+    if not nodes:
+        raise SbError("没解析出任何节点（订阅可能为空、或被反爬返回了 HTML）。")
+    out = Path(outpath).expanduser() if outpath else SUB_OUT
+    out.write_text(json.dumps(nodes, ensure_ascii=False, indent=2), encoding="utf-8")
+    print()
+    print(f"已写出 sing-box 出站 JSON（{len(nodes)} 个）：{out}")
+    print("把里面的对象并入 config.json 的 outbounds，再把对应 tag 加进策略组即可。")
+
+
+# ---------------------------------------------------------------------------
+# 订阅管理：命名保存到 ~/.config/sing-box/subs/<名字>.json，可更新/删除/列出
+# 每个文件含 {name,url,format,updated_at,count,nodes:[...sing-box 出站...]}
+# ---------------------------------------------------------------------------
+SUBS_DIR = CONFIG_DIR / "subs"
+
+
+def _sub_safe_name(name):
+    if not name or name in (".", "..") or re.search(r"[/\\]", name) or name.startswith("."):
+        raise SbError(f"订阅名不合法：{name!r}（不能含 / \\、不能以 . 开头）")
+    return name
+
+
+def _sub_path(name):
+    return SUBS_DIR / f"{_sub_safe_name(name)}.json"
+
+
+def _list_subs():
+    if not SUBS_DIR.exists():
+        return []
+    out = []
+    for p in sorted(SUBS_DIR.glob("*.json")):
+        try:
+            out.append(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:
+            out.append({"name": p.stem, "url": "", "format": "(损坏)", "count": 0, "updated_at": ""})
+    return out
+
+
+def _sub_fetch_save(name, source):
+    """抓取 source、解析、存到 subs/<name>.json（覆盖）。返回节点数。"""
+    fmt, (nodes, skipped) = _extract_nodes(_fetch_sub(source))
+    _dedupe_tags(nodes)
+    _print_sub_result(fmt, nodes, skipped)
+    if not nodes:
+        raise SbError("没解析出任何节点（订阅可能为空、或被反爬返回了 HTML），未保存。")
+    is_url = source.startswith(("http://", "https://"))
+    data = {
+        "name": name,
+        "url": source if is_url else "",       # 仅 URL 来源可自动更新
+        "source": source,
+        "format": fmt,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "count": len(nodes),
+        "nodes": nodes,
+    }
+    SUBS_DIR.mkdir(parents=True, exist_ok=True)
+    _sub_path(name).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return len(nodes)
+
+
+def sub_add(name, source):
+    name = _sub_safe_name(name)
+    if _sub_path(name).exists():
+        raise SbError(f"订阅 '{name}' 已存在。更新用 sb sub update {name}，或先 sb sub del {name}。")
+    n = _sub_fetch_save(name, source)
+    print()
+    print(f"已保存订阅 '{name}'（{n} 节点）：{_sub_path(name)}")
+
+
+def sub_update(name=None):
+    if name is None:
+        subs = _list_subs()
+        updatable = [s for s in subs if s.get("url")]
+        if not subs:
+            raise SbError("还没有已保存的订阅。")
+        if not updatable:
+            raise SbError("没有可更新的订阅（都不是 URL 来源）。")
+        for s in updatable:
+            print(f"== 更新 '{s['name']}' ==")
+            try:
+                old = s.get("count", 0)
+                n = _sub_fetch_save(s["name"], s["url"])
+                print(f"'{s['name']}'：{old} -> {n} 节点\n")
+            except SbError as e:
+                print(f"'{s['name']}' 更新失败：{e}\n", file=sys.stderr)
+        return
+    name = _sub_safe_name(name)
+    p = _sub_path(name)
+    if not p.exists():
+        raise SbError(f"没有名为 '{name}' 的订阅。sb sub list 查看。")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    url = data.get("url")
+    if not url:
+        raise SbError(f"订阅 '{name}' 不是 URL 来源（来自文件/直接内容），无法自动更新；"
+                      f"请 sb sub del {name} 后重新 sb sub add。")
+    old = data.get("count", 0)
+    n = _sub_fetch_save(name, url)
+    print()
+    print(f"已更新订阅 '{name}'：{old} -> {n} 节点。")
+
+
+def sub_list():
+    subs = _list_subs()
+    if not subs:
+        print("还没有已保存的订阅。添加：sb sub add <名字> <订阅URL|文件>")
+        return
+    active = load_state().get("active_sub") or ""
+    print(f"已保存 {len(subs)} 个订阅（{SUBS_DIR}）；★ = 当前已应用：")
+    print(f"  {'':2}{'名字':16}{'节点':>5}  {'更新时间':19}  {'格式':22} 来源")
+    for d in subs:
+        src = d.get("url") or d.get("source") or "(文件/内容)"
+        if len(src) > 50:
+            src = src[:47] + "..."
+        mark = "★ " if d.get("name") == active else "  "
+        print(f"  {mark}{d.get('name',''):16}{d.get('count',0):>5}  "
+              f"{d.get('updated_at',''):19}  {d.get('format',''):22} {src}")
+
+
+def sub_del(name):
+    name = _sub_safe_name(name)
+    p = _sub_path(name)
+    if not p.exists():
+        raise SbError(f"没有名为 '{name}' 的订阅。sb sub list 查看。")
+    p.unlink()
+    st = load_state()
+    if st.get("active_sub") == name:
+        st["active_sub"] = ""
+        save_state(st)
+    print(f"已删除订阅 '{name}'。")
+
+
+def sub_show(name):
+    name = _sub_safe_name(name)
+    p = _sub_path(name)
+    if not p.exists():
+        raise SbError(f"没有名为 '{name}' 的订阅。sb sub list 查看。")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    nodes = data.get("nodes", [])
+    print(f"订阅 '{name}'：{data.get('count', len(nodes))} 节点 | 更新于 {data.get('updated_at','?')} "
+          f"| 来源 {data.get('url') or data.get('source') or '(文件/内容)'}")
+    print(f"文件：{p}")
+    print()
+    _print_sub_result(data.get("format", "?"), nodes, [])
+
+
+# ----- 选用某订阅：把它的节点应用进 config.json（保留顶层组/路由/DNS）-----
+_REGION_ORDER = ["hk", "jp", "sg", "tw", "us"]
+_REGION_AUTO = {"hk", "jp", "sg", "tw"}            # us 不做自动测速（AI 需 IP 稳定）
+_TOP_GROUPS = {"proxy", "ai", "youtube", "google", "github", "telegram"}
+_REGION_KEYS = [
+    ("tw", ["台湾", "臺灣", "taiwan", "tw"]),       # 台湾常用 🇨🇳 旗，靠关键词归 tw
+    ("hk", ["🇭🇰", "香港", "hongkong", "hong kong", "hk"]),
+    ("jp", ["🇯🇵", "日本", "japan", "tokyo", "osaka", "jp"]),
+    ("sg", ["🇸🇬", "新加坡", "狮城", "singapore", "sg"]),
+    ("us", ["🇺🇸", "美国", "美國", "united states", "america", "los angeles", "san jose", "usa", "us"]),
+]
+
+
+def _detect_region(tag):
+    t = tag.lower()
+    for region, kws in _REGION_KEYS:
+        for kw in kws:
+            if re.fullmatch(r"[a-z]{2,3}", kw):           # 字母代码：词边界，防误匹配
+                if re.search(r"(?<![a-z])" + kw + r"(?![a-z])", t):
+                    return region
+            elif kw in tag or kw in t:                    # emoji / 中文 / 英文全名：子串
+                return region
+    return None
+
+
+def _apply_sub_nodes(cfg, nodes):
+    """保留顶层组与 direct/dns，按地区重建区组，用 nodes 替换叶子节点。返回 (buckets, others)。"""
+    reserved = _TOP_GROUPS | set(_REGION_ORDER) | {r + "-auto" for r in _REGION_ORDER} | {"direct", "block"}
+    seen = set()
+    for n in nodes:
+        tag = n["tag"]
+        if tag in reserved or tag in seen:
+            k = 2
+            while f"{tag}~{k}" in seen or f"{tag}~{k}" in reserved:
+                k += 1
+            tag = f"{tag}~{k}"
+            n["tag"] = tag
+        seen.add(tag)
+
+    buckets = {r: [] for r in _REGION_ORDER}
+    others = []
+    for n in nodes:
+        r = _detect_region(n["tag"])
+        (buckets[r] if r in buckets else others).append(n["tag"])
+
+    old = cfg.get("outbounds", [])
+    keep_top = [o for o in old if o.get("tag") in _TOP_GROUPS]
+    keep_misc = [o for o in old if o.get("type") in ("direct", "block", "dns")]
+    old_region_default = {o["tag"]: o.get("default") for o in old
+                          if o.get("tag") in _REGION_ORDER and o.get("type") == "selector"}
+
+    region_groups, region_autos = [], []
+    for r in _REGION_ORDER:
+        tags = buckets[r]
+        has_auto = r in _REGION_AUTO and bool(tags)
+        members = ([f"{r}-auto"] if has_auto else []) + tags
+        if not members:
+            members = ["direct"]
+        old_def = old_region_default.get(r)
+        if old_def in tags:
+            default = old_def
+        elif has_auto:
+            default = f"{r}-auto"
+        elif tags:
+            default = tags[0]
+        else:
+            default = "direct"
+        sel = {"type": "selector", "tag": r, "outbounds": members, "default": default}
+        if r != "us":
+            sel["interrupt_exist_connections"] = True
+        region_groups.append(sel)
+        if has_auto:
+            region_autos.append({"type": "urltest", "tag": f"{r}-auto", "outbounds": tags,
+                                 "url": "https://www.gstatic.com/generate_204",
+                                 "interval": "3m", "tolerance": 50,
+                                 "interrupt_exist_connections": True})
+
+    cfg["outbounds"] = keep_top + region_groups + region_autos + list(nodes) + keep_misc
+    return buckets, others
+
+
+def sub_use(name):
+    name = _sub_safe_name(name)
+    p = _sub_path(name)
+    if not p.exists():
+        raise SbError(f"没有名为 '{name}' 的订阅。sb sub list 查看。")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    nodes = json.loads(json.dumps(data.get("nodes") or []))   # 深拷贝，去重时不改原文件
+    if not nodes:
+        raise SbError(f"订阅 '{name}' 没有节点。")
+
+    cfg = load_config()
+    buckets, others = _apply_sub_nodes(cfg, nodes)
+
+    backup = CONFIG.with_name("config.json.bak-before-subuse")
+    shutil.copy2(CONFIG, backup)
+    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    result = run(["sing-box", "check", "-c", str(CONFIG)], capture=True)
+    if result.returncode != 0:
+        shutil.copy2(backup, CONFIG)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        raise SbError("应用后配置校验失败，已回滚（config.json 未改动）。")
+
+    st = load_state()
+    st["active_sub"] = name
+    save_state(st)
+
+    print(f"已切换到订阅 '{name}'（{len(nodes)} 个节点）")
+    print("各区分布：" + ", ".join(f"{r}×{len(buckets[r])}" for r in _REGION_ORDER))
+    if others:
+        print(f"未归类 {len(others)} 个（不在区组里，但已作为出站，可在面板/Clash API 单独选）")
+    for r in _REGION_ORDER:
+        if not buckets[r]:
+            print(f"  ⚠️ {r} 区无节点 → 该区已指向 direct（顶层组里走 {r} 的会变直连）")
+    print(f"备份：{backup}")
+    print("执行 sb restart 生效。")
+
+
+# ---------------------------------------------------------------------------
+# 帮助 / 入口
+# ---------------------------------------------------------------------------
+def help_text():
+    print("""sb - sing-box 日常管理工具
+
+语法：sb <主题> <动作> [参数]   （start/stop/restart/status 等高频命令在顶层）
+组名：proxy ai youtube google github telegram | hk jp sg tw us（区组）| main（=4个服务组）
+
+守护（默认 tun 全局透明代理，需 root）：
+  sb start [--mixed]       启动；--mixed = mixed 代理+系统代理（不需 root，Node 类需自带 HTTPS_PROXY）
+  sb stop                  停止（自动识别 tun/mixed）并清理系统代理
+  sb restart               重启（默认 tun）
+  sb status                进程/端口/Clash API/tun/系统代理/策略默认值
+  sb tun on|off            显式启停 tun 守护（on 同 start，off 同 stop）
+
+切换节点（不重启，秒生效；重启回配置默认）：
+  sb use <组> [list|编号|auto|名字]
+    list（或省略）= 列出该组节点（编号/★当前/延迟）；编号 = 切 list 第 N 个；
+    auto = 切该组 *-auto；名字 = 按名切（兼容）
+  sb use                   等于 group now，看各组当前选择
+  例：sb use us list   sb use us 2   sb use sg auto   sb use proxy 5   sb use main 5
+
+设默认（写 config.json，重启后生效；用法与 use 对称，不需 daemon）：
+  sb set <组> [list|编号|auto|名字]
+  例：sb set us list   sb set us 2   sb set proxy 5   sb set main sg
+
+订阅（入库到 ~/.config/sing-box/subs/，只存节点）：
+  sb sub list                    列出已保存订阅（★=当前已应用）
+  sb sub add <名字> <URL|文件>   拉取并命名保存（同名拒绝）
+  sb sub use <名字>              应用进 config.json（重建区组/替换叶子；备份+校验+回滚），之后 sb restart
+  sb sub update [名字]           按保存的 URL 刷新；省略名字=全部
+  sb sub show <名字>             查看解析出的节点
+  sb sub del <名字>              删除
+  sb sub parse <URL|文件> [json] 一次性解析(Clash/Loon/Surge/Shadowrocket/base64)只取节点，不入库
+
+策略组：
+  sb groups                所有组情况（类型/当前/出口/延迟/默认差异）
+  sb group <组>            看单组详情（成员/★当前/延迟；需 daemon 在跑）
+  sb group now             各 selector 当前选择
+
+测试：
+  sb test [main|ai|cn|proxy]   省略=全测；main=YT/GH/Google ai=ChatGPT/Claude cn=百度/豆包 proxy=出口IP
+
+日志：
+  sb log tail [--tun]      看最新日志（--tun 看 tun 日志）
+  sb log on|off|status     开关/查看自动保存日志
+  sb log clean             清理历史日志归档
+
+其它：
+  sb api | ui | conns      Clash API 测试 / 打开面板 / 抓连接快照
+  sb rules update          重下本地 .srs 规则集（带回滚；之后 sb restart）
+  sb proxy clean           只清理系统代理残留
+""")
+
+
+# 可切换/可设默认的组（含 main 宏）
+GROUP_NAMES = set(USE_GROUPS) | {"main"}
+
+
+def _arg1(rest, usage):
+    if len(rest) != 1:
+        raise SbError("用法：" + usage)
+    return rest[0]
+
+
+def _switch(args, group_fn, main_fn, verb):
+    """use / set 共用：把组当参数，list/编号/auto/名字交给底层。"""
+    if not args:
+        if verb == "use":
+            selectors()
+            return
+        raise SbError(f"用法：sb set <组> [list|编号|auto|名字]。组：{', '.join(sorted(GROUP_NAMES))}")
+    group = args[0]
+    arg = args[1] if len(args) > 1 else "list"
+    if group == "main":
+        main_fn(arg)
+    elif group in USE_GROUPS:
+        group_fn(USE_GROUPS[group], arg)
+    else:
+        raise SbError(f"未知组：{group}。可用：{', '.join(sorted(GROUP_NAMES))}")
+
+
+def do_start(args):
+    if "--mixed" in args or "mixed" in args:
+        start_mixed()
+    else:
+        start()
+
+
+def do_sub(args):
+    action = args[0] if args else "list"
+    rest = args[1:]
+    if action == "list":
+        sub_list()
+    elif action == "add":
+        if len(rest) != 2:
+            raise SbError("用法：sb sub add <名字> <订阅URL|文件>")
+        sub_add(rest[0], rest[1])
+    elif action == "use":
+        sub_use(_arg1(rest, "sb sub use <名字>"))
+    elif action == "update":
+        sub_update(rest[0] if rest else None)
+    elif action == "show":
+        sub_show(_arg1(rest, "sb sub show <名字>"))
+    elif action == "del":
+        sub_del(_arg1(rest, "sb sub del <名字>"))
+    elif action == "parse":
+        if not rest:
+            raise SbError("用法：sb sub parse <订阅URL|文件> [输出json]")
+        parse_sub(rest[0], rest[1] if len(rest) > 1 else None)
+    else:
+        raise SbError(f"未知 sub 动作：{action}。可用：list/add/use/update/show/del/parse")
+
+
+def do_log(args):
+    tun = "--tun" in args
+    rest = [a for a in args if a != "--tun"]
+    action = rest[0] if rest else "tail"
+    if action == "tail":
+        logs_tun() if tun else logs()
+    elif action == "on":
+        log_on()
+    elif action == "off":
+        log_off()
+    elif action == "status":
+        log_status()
+    elif action == "clean":
+        clean_logs()
+    else:
+        raise SbError(f"未知 log 动作：{action}。可用：tail/on/off/status/clean（tail 可加 --tun）")
+
+
+def do_test(args):
+    t = args[0] if args else "all"
+    fns = {"all": test_all, "main": test_main, "ai": test_ai,
+           "cn": test_cn, "proxy": test_proxy}
+    if t not in fns:
+        raise SbError(f"未知 test 目标：{t}。可用：(空)/main/ai/cn/proxy")
+    fns[t]()
+
+
+def do_group(args):
+    action = args[0] if args else "ls"
+    if action in ("ls", "list"):
+        groups()
+    elif action == "now":
+        selectors()
+    elif action == "main":
+        list_group_nodes(SERVICE_SELECTORS[MAIN_SERVICES[0]], label="main")
+    elif action in USE_GROUPS:
+        list_group_nodes(USE_GROUPS[action])
+    else:
+        raise SbError(
+            f"未知 group 参数：{action}。\n"
+            f"sb groups 看全部 | sb group <组> 看单组详情 | sb group now 看当前选择")
+
+
+def do_rules(args):
+    action = args[0] if args else "update"
+    if action == "update":
+        update_rules()
+    else:
+        raise SbError(f"未知 rules 动作：{action}。可用：update")
+
+
+def do_tun(args):
+    action = args[0] if args else None
+    if action == "on":
+        tun_on()
+    elif action == "off":
+        tun_off()
+    else:
+        raise SbError("用法：sb tun on|off")
+
+
+def do_proxy(args):
+    action = args[0] if args else None
+    if action == "clean":
+        clean_proxy()
+    else:
+        raise SbError("用法：sb proxy clean")
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        help_text()
+        return
+
+    cmd, args = argv[0], argv[1:]
+
+    noarg = {
+        "stop": stop, "restart": restart, "status": status,
+        "groups": groups,
+        "api": api, "ui": ui, "conns": conns,
+        "help": help_text, "-h": help_text, "--help": help_text,
+    }
+    topics = {
+        "sub": do_sub, "log": do_log, "test": do_test, "group": do_group,
+        "rules": do_rules, "tun": do_tun, "proxy": do_proxy,
+        "start": do_start,
+    }
+
+    try:
+        if cmd == "use":
+            _switch(args, use_group, use_main_group, "use")
+        elif cmd == "set":
+            _switch(args, route_group, route_main_group, "set")
+        elif cmd in topics:
+            topics[cmd](args)
+        elif cmd in noarg:
+            noarg[cmd]()
+        else:
+            print(f"未知命令：{cmd}", file=sys.stderr)
+            help_text()
+            sys.exit(1)
+    except SbError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
