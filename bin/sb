@@ -2306,9 +2306,49 @@ def _parse_loon(text):
     return nodes, skipped
 
 
+def _parse_singbox_json(text):
+    """sing-box JSON 订阅：整份 config（取 outbounds）或纯 outbounds 数组。
+    节点 = 带 server+tag 的出站；selector/urltest/direct/block/dns 等非节点跳过。
+    这些对象本身已是 sing-box 出站格式，基本原样透传。"""
+    obj = json.loads(text)
+    if isinstance(obj, dict):
+        obs = obj.get("outbounds")
+    elif isinstance(obj, list):
+        obs = obj
+    else:
+        obs = None
+    nodes, skipped = [], []
+    nonnode = {"selector", "urltest", "direct", "block", "dns"}
+    for o in obs or []:
+        if not isinstance(o, dict):
+            continue
+        t = (o.get("type") or "").lower()
+        if t in nonnode:
+            continue
+        if not o.get("server") or not o.get("tag"):
+            skipped.append(t or "?")
+            continue
+        node = dict(o)
+        try:
+            node["server_port"] = int(node.get("server_port") or 0)
+        except (TypeError, ValueError):
+            node["server_port"] = 0
+        nodes.append(node)
+    return nodes, skipped
+
+
 def _extract_nodes(content):
     """识别订阅格式并提取节点，返回 (格式名, (nodes, skipped))。"""
     c = content.strip()
+    # sing-box JSON（整份 config 或 outbounds 数组）必须先于 "://" 判定：
+    # 整份 config 的 urltest.url 含 "://"，否则会被误判成明文 URI 列表。
+    if c[:1] in "{[":
+        try:
+            res = _parse_singbox_json(c)
+            if res[0]:
+                return "sing-box(JSON)", res
+        except ValueError:
+            pass
     if _looks_base64(c):
         dec = _b64decode_text(c)
         if dec and "://" in dec:
@@ -2319,7 +2359,7 @@ def _extract_nodes(content):
         return "Loon/Surge(INI)", _parse_loon(c)
     if "://" in c:
         return "明文 URI 列表", _parse_uri_list(c)
-    raise SbError("无法识别的订阅格式（既不是 base64/Clash/Loon，也没有 URI）。")
+    raise SbError("无法识别的订阅格式（既不是 sing-box JSON/base64/Clash/Loon，也没有 URI）。")
 
 
 def _fetch_sub(source):

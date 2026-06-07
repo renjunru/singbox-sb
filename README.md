@@ -9,7 +9,7 @@
 ## 特性
 
 - **两种模式**：`tun` 全局透明代理（root 守护）/ `mixed` 系统代理（免 root）
-- **订阅导入**：支持 Clash/Mihomo YAML、Loon/Surge、Shadowrocket/base64、明文 URI；
+- **订阅导入**：支持 sing-box JSON、Clash/Mihomo YAML、Loon/Surge、Shadowrocket/base64、明文 URI；
   自动按地区（港/日/新/台/美）重建策略组
 - **分流规则**：AI / YouTube / Google / GitHub / Telegram / 国内直连等按服务切换出口
 - **诊断**：日志归档、连接快照、出口 IP 测试、Clash 面板
