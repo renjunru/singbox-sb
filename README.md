@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/renjunru/singbox-sb/main/install.sh
 
 一条命令搞定：装 **sing-box 本体** + 装 **`sb` 脚本** + 铺 **配置模板 / 规则清单**。
 
-- 已装 Homebrew 但缺 sing-box → 提示你 `brew install sing-box`（便于日后升级）
+- 已装 Homebrew → 自动 `brew install sing-box`（便于日后升级）
 - 没装 Homebrew → 自动从 GitHub 下载对应架构的 sing-box 二进制到 `~/.local/bin/`
 - 已装 sing-box → 跳过
 

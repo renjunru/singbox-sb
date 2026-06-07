@@ -62,8 +62,8 @@ install_singbox_from_github() {
 if command -v sing-box >/dev/null 2>&1; then
   say "已检测到 sing-box：$(command -v sing-box)"
 elif command -v brew >/dev/null 2>&1; then
-  warn "检测到 Homebrew，但未装 sing-box。请运行： brew install sing-box"
-  warn "（装好后再 sb start；本次继续安装 sb 脚本与配置。）"
+  say "检测到 Homebrew，安装 sing-box：brew install sing-box"
+  brew install sing-box || warn "brew install sing-box 失败，请手动安装后再 sb start。"
 else
   install_singbox_from_github || warn "sing-box 未自动安装，请手动安装后再 sb start。"
 fi
