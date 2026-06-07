@@ -44,10 +44,21 @@ sb sub add 我的机场 "<你的订阅链接>"   # 保存订阅
 sb sub use 我的机场                    # 把节点应用进 config.json
 sb rules update                        # 下载分流规则集
 sb start                               # 启动 tun 全局代理
-sb status                              # 查看状态
+sb status                              # 一行概览（进程/端口/API/各组当前出口）
+sb status -v                           # 详情（全网络服务/候选节点/进程）
 ```
 
-常用命令见 `sb`（无参数）打印的帮助。
+日常切换出口（无需重启，秒生效）：
+
+```bash
+sb use us list      # 列出 us 组节点（编号/★当前/延迟）
+sb use us 2         # 临时切到该组第 2 个节点
+sb use proxy auto   # 切到该组的 *-auto 自动测速
+sb set us 2         # 设为持久默认（写 config.json，重启后仍生效）
+```
+
+> 组名：`proxy ai youtube google github telegram`（按服务）｜ `hk jp sg tw us`（按地区）｜ `main`（= 4 个服务组一起设）。
+> 完整命令清单见 `sb`（无参数）打印的帮助。
 
 ## 更新
 
