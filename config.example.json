@@ -24,7 +24,7 @@
         "us",
         "direct"
       ],
-      "default": "sg",
+      "default": "hk",
       "interrupt_exist_connections": true
     },
     {
@@ -65,7 +65,7 @@
         "us",
         "direct"
       ],
-      "default": "sg",
+      "default": "hk",
       "interrupt_exist_connections": true
     },
     {
@@ -79,7 +79,7 @@
         "us",
         "direct"
       ],
-      "default": "sg",
+      "default": "hk",
       "interrupt_exist_connections": true
     },
     {
@@ -101,8 +101,13 @@
       "tag": "hk",
       "outbounds": [
         "hk-auto",
-        "🇭🇰 香港节点示例 1",
-        "🇭🇰 香港节点示例 2"
+        "🇭🇰 香港节点 01",
+        "🇭🇰 香港节点 02",
+        "🇭🇰 香港节点 03",
+        "🇭🇰 香港节点 04",
+        "🇭🇰 香港节点 05",
+        "🇭🇰 香港节点 06",
+        "🇭🇰 香港节点 07"
       ],
       "default": "hk-auto",
       "interrupt_exist_connections": true
@@ -112,8 +117,10 @@
       "tag": "jp",
       "outbounds": [
         "jp-auto",
-        "🇯🇵 日本节点示例 1",
-        "🇯🇵 日本节点示例 2"
+        "🇯🇵 日本节点 01",
+        "🇯🇵 日本节点 02",
+        "🇯🇵 日本节点 03",
+        "🇯🇵 日本节点 04"
       ],
       "default": "jp-auto",
       "interrupt_exist_connections": true
@@ -123,8 +130,10 @@
       "tag": "sg",
       "outbounds": [
         "sg-auto",
-        "🇸🇬 新加坡节点示例 1",
-        "🇸🇬 新加坡节点示例 2"
+        "🇸🇬 新加坡节点 01",
+        "🇸🇬 新加坡节点 02",
+        "🇸🇬 新加坡节点 03",
+        "🇸🇬 新加坡节点 04"
       ],
       "default": "sg-auto",
       "interrupt_exist_connections": true
@@ -134,8 +143,8 @@
       "tag": "tw",
       "outbounds": [
         "tw-auto",
-        "🇨🇳 台湾节点示例 1",
-        "🇨🇳 台湾节点示例 2"
+        "🇹🇼 台湾节点 01",
+        "🇹🇼 台湾节点 02"
       ],
       "default": "tw-auto",
       "interrupt_exist_connections": true
@@ -144,17 +153,25 @@
       "type": "selector",
       "tag": "us",
       "outbounds": [
-        "🇺🇸 美国节点示例 1",
-        "🇺🇸 美国节点示例 2"
+        "🇺🇸 美国节点 01",
+        "🇺🇸 美国节点 02",
+        "🇺🇸 美国节点 03",
+        "🇺🇸 美国节点 04",
+        "🇺🇸 美国节点 05"
       ],
-      "default": "🇺🇸 美国节点示例 1"
+      "default": "🇺🇸 美国节点 02"
     },
     {
       "type": "urltest",
       "tag": "hk-auto",
       "outbounds": [
-        "🇭🇰 香港节点示例 1",
-        "🇭🇰 香港节点示例 2"
+        "🇭🇰 香港节点 01",
+        "🇭🇰 香港节点 02",
+        "🇭🇰 香港节点 03",
+        "🇭🇰 香港节点 04",
+        "🇭🇰 香港节点 05",
+        "🇭🇰 香港节点 06",
+        "🇭🇰 香港节点 07"
       ],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "3m",
@@ -165,8 +182,10 @@
       "type": "urltest",
       "tag": "jp-auto",
       "outbounds": [
-        "🇯🇵 日本节点示例 1",
-        "🇯🇵 日本节点示例 2"
+        "🇯🇵 日本节点 01",
+        "🇯🇵 日本节点 02",
+        "🇯🇵 日本节点 03",
+        "🇯🇵 日本节点 04"
       ],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "3m",
@@ -177,8 +196,10 @@
       "type": "urltest",
       "tag": "sg-auto",
       "outbounds": [
-        "🇸🇬 新加坡节点示例 1",
-        "🇸🇬 新加坡节点示例 2"
+        "🇸🇬 新加坡节点 01",
+        "🇸🇬 新加坡节点 02",
+        "🇸🇬 新加坡节点 03",
+        "🇸🇬 新加坡节点 04"
       ],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "3m",
@@ -189,8 +210,8 @@
       "type": "urltest",
       "tag": "tw-auto",
       "outbounds": [
-        "🇨🇳 台湾节点示例 1",
-        "🇨🇳 台湾节点示例 2"
+        "🇹🇼 台湾节点 01",
+        "🇹🇼 台湾节点 02"
       ],
       "url": "https://www.gstatic.com/generate_204",
       "interval": "3m",
@@ -198,98 +219,368 @@
       "interrupt_exist_connections": true
     },
     {
+      "type": "anytls",
+      "tag": "🇭🇰 香港节点 01",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇭🇰 香港节点 02",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇭🇰 香港节点 03",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇭🇰 香港节点 04",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇭🇰 香港节点 05",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇭🇰 香港节点 06",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇭🇰 香港节点 07",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇹🇼 台湾节点 01",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇹🇼 台湾节点 02",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇸🇬 新加坡节点 01",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇸🇬 新加坡节点 02",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇸🇬 新加坡节点 03",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇸🇬 新加坡节点 04",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇯🇵 日本节点 01",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇯🇵 日本节点 02",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇯🇵 日本节点 03",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇯🇵 日本节点 04",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇺🇸 美国节点 01",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇺🇸 美国节点 02",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇺🇸 美国节点 03",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇺🇸 美国节点 04",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇺🇸 美国节点 05",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇩🇪 德国节点 01",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "🇫🇷 法国节点 01",
+      "server": "REPLACE_WITH_YOUR_NODE.example.com",
+      "server_port": 443,
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "REPLACE_WITH_YOUR_SNI.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
       "type": "direct",
       "tag": "direct"
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "🇭🇰 香港节点示例 1",
-      "server": "REPLACE_WITH_YOUR_NODE.example.com",
-      "server_port": 443,
-      "method": "aes-128-gcm",
-      "password": "REPLACE_WITH_YOUR_PASSWORD",
-      "network": "tcp"
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "🇭🇰 香港节点示例 2",
-      "server": "REPLACE_WITH_YOUR_NODE.example.com",
-      "server_port": 443,
-      "method": "aes-128-gcm",
-      "password": "REPLACE_WITH_YOUR_PASSWORD",
-      "network": "tcp"
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "🇯🇵 日本节点示例 1",
-      "server": "REPLACE_WITH_YOUR_NODE.example.com",
-      "server_port": 443,
-      "method": "aes-128-gcm",
-      "password": "REPLACE_WITH_YOUR_PASSWORD",
-      "network": "tcp"
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "🇯🇵 日本节点示例 2",
-      "server": "REPLACE_WITH_YOUR_NODE.example.com",
-      "server_port": 443,
-      "method": "aes-128-gcm",
-      "password": "REPLACE_WITH_YOUR_PASSWORD",
-      "network": "tcp"
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "🇸🇬 新加坡节点示例 1",
-      "server": "REPLACE_WITH_YOUR_NODE.example.com",
-      "server_port": 443,
-      "method": "aes-128-gcm",
-      "password": "REPLACE_WITH_YOUR_PASSWORD",
-      "network": "tcp"
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "🇸🇬 新加坡节点示例 2",
-      "server": "REPLACE_WITH_YOUR_NODE.example.com",
-      "server_port": 443,
-      "method": "aes-128-gcm",
-      "password": "REPLACE_WITH_YOUR_PASSWORD",
-      "network": "tcp"
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "🇨🇳 台湾节点示例 1",
-      "server": "REPLACE_WITH_YOUR_NODE.example.com",
-      "server_port": 443,
-      "method": "aes-128-gcm",
-      "password": "REPLACE_WITH_YOUR_PASSWORD",
-      "network": "tcp"
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "🇨🇳 台湾节点示例 2",
-      "server": "REPLACE_WITH_YOUR_NODE.example.com",
-      "server_port": 443,
-      "method": "aes-128-gcm",
-      "password": "REPLACE_WITH_YOUR_PASSWORD",
-      "network": "tcp"
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "🇺🇸 美国节点示例 1",
-      "server": "REPLACE_WITH_YOUR_NODE.example.com",
-      "server_port": 443,
-      "method": "aes-128-gcm",
-      "password": "REPLACE_WITH_YOUR_PASSWORD",
-      "network": "tcp"
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "🇺🇸 美国节点示例 2",
-      "server": "REPLACE_WITH_YOUR_NODE.example.com",
-      "server_port": 443,
-      "method": "aes-128-gcm",
-      "password": "REPLACE_WITH_YOUR_PASSWORD",
-      "network": "tcp"
     }
   ],
   "route": {
@@ -381,10 +672,6 @@
         "outbound": "direct"
       },
       {
-        "protocol": "quic",
-        "action": "reject"
-      },
-      {
         "rule_set": [
           "geosite-category-ads-all"
         ],
@@ -414,6 +701,7 @@
           "ChatGPT",
           "Codex",
           "codex",
+          "agy",
           "Obsidian",
           "Obsidian Helper",
           "Obsidian Helper (GPU)",
@@ -464,6 +752,10 @@
         ],
         "action": "route",
         "outbound": "direct"
+      },
+      {
+        "protocol": "quic",
+        "action": "reject"
       },
       {
         "rule_set": [
@@ -566,10 +858,14 @@
         }
       },
       {
-        "type": "tcp",
+        "type": "https",
         "tag": "dns-ai-us",
         "server": "1.1.1.1",
-        "server_port": 53,
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+          "server_name": "cloudflare-dns.com"
+        },
         "detour": "ai"
       },
       {
@@ -581,13 +877,6 @@
       }
     ],
     "rules": [
-      {
-        "query_type": [
-          64,
-          65
-        ],
-        "action": "reject"
-      },
       {
         "domain_suffix": [
           "lan",
@@ -645,6 +934,27 @@
       },
       {
         "rule_set": [
+          "geosite-cn"
+        ],
+        "action": "route",
+        "server": "dns-direct-ali"
+      },
+      {
+        "domain_suffix": [
+          "cn"
+        ],
+        "action": "route",
+        "server": "dns-direct-ali"
+      },
+      {
+        "query_type": [
+          64,
+          65
+        ],
+        "action": "reject"
+      },
+      {
+        "rule_set": [
           "geosite-openai",
           "geosite-ai-foreign"
         ],
@@ -676,20 +986,6 @@
         ],
         "action": "route",
         "server": "dns-ai-us"
-      },
-      {
-        "rule_set": [
-          "geosite-cn"
-        ],
-        "action": "route",
-        "server": "dns-direct-ali"
-      },
-      {
-        "domain_suffix": [
-          "cn"
-        ],
-        "action": "route",
-        "server": "dns-direct-ali"
       },
       {
         "query_type": [

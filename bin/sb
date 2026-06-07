@@ -1037,7 +1037,122 @@ def clean_logs():
         print(f"保留当前运行日志：{cur_path}")
 
 
-def status(quick=False):
+def _route_iface():
+    """承载默认路由的物理网卡（en0 等）；取不到返回 None。"""
+    r = run(["route", "-n", "get", "default"], capture=True)
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("interface:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _iface_to_service():
+    """Device(en0) -> 网络服务名(Ethernet) 映射。"""
+    m, name = {}, None
+    r = run(["networksetup", "-listnetworkserviceorder"], capture=True)
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if "Device:" in line:
+            dev = line.split("Device:", 1)[1].strip().rstrip(")").strip()
+            if name and dev:
+                m[dev] = name
+        elif line.startswith("(") and ") " in line:
+            name = line.split(") ", 1)[1].strip().lstrip("*").strip()
+    return m
+
+
+def primary_service():
+    """当前生效的网络服务（默认路由所在网卡对应的服务名）；取不到返回 None。"""
+    iface = _route_iface()
+    if not iface:
+        return None
+    return _iface_to_service().get(iface)
+
+
+def _proxy_compact(service):
+    """把 proxy_status 的逐协议详情压成 'on (host:port)' / 'off'。"""
+    full = proxy_status(service)
+    if "=ON(" in full:
+        return f"on ({full.split('=ON(', 1)[1].split(')', 1)[0]})"
+    return "off"
+
+
+def _delay_text(delay):
+    if delay is None:
+        return ""
+    if delay == 0:
+        return " (超时)"
+    return f" ({delay}ms)"
+
+
+def _print_runtime_exits(proxies):
+    """运行时各策略组当前出口：tag → now [→ 叶子] (延迟)，一行一个。"""
+    print("出口（运行时）：")
+    width = max((len(t) for t in WANTED_SELECTORS), default=0)
+    for tag in WANTED_SELECTORS:
+        p = proxies.get(tag)
+        if not p:
+            print(f"  {tag.ljust(width)}  (API 未找到)")
+            continue
+        now = p.get("now", "?")
+        leaf = _resolve_leaf(proxies, now)
+        arrow = now if leaf == now else f"{now} → {leaf}"
+        print(f"  {tag.ljust(width)}  {arrow}{_delay_text(_node_delay(proxies, leaf))}")
+
+
+def _print_config_defaults(data):
+    """停止 / API 不可用时退回看 config.json 里的持久默认。"""
+    print("默认出口（配置）：")
+    width = max((len(t) for t in WANTED_SELECTORS), default=0)
+    for tag in WANTED_SELECTORS:
+        for outbound in data.get("outbounds", []):
+            if outbound.get("tag") == tag:
+                print(f"  {tag.ljust(width)}  {outbound.get('default', '(无 default)')}")
+                break
+
+
+def status(quick=False, verbose=False):
+    if verbose:
+        _status_full(quick)
+        return
+
+    print()
+    # 第一行：是否在跑 / 模式 / 端口 / API / 日志，全压一行。
+    # 进程态可能谎报（launchd 竞态），所以把端口、API 一起摆出来由人判断真伪。
+    if pgrep_singbox():
+        mode = "tun" if tun_running() else "mixed"
+        port_part = f":{LISTEN_PORT} {'✓' if is_port_listening() else '✗'}"
+        if quick:
+            api_up, api_part = False, "API 启动中"
+        else:
+            api_up = clash_api_available()
+            api_part = "API ✓" if api_up else "API ✗"
+        log_part = "日志 on" if is_auto_log_enabled() else "日志 off"
+        print(f"sing-box: running ({mode}) · {port_part} · {api_part} · {log_part}")
+    else:
+        api_up = False
+        if DAEMON_PLIST.exists():
+            print("sing-box: stopped（tun daemon 已安装，sb tun on 启动）")
+        else:
+            print("sing-box: stopped（tun 未安装；sb tun on 启用）")
+
+    svc = primary_service()
+    if not (svc and service_exists(svc)):
+        svc = next((s for s in NETWORK_SERVICES if service_exists(s)), None)
+    print(f"代理（{svc}）：{_proxy_compact(svc)}" if svc else "代理：无可用网络服务")
+
+    print()
+    if api_up:
+        _print_runtime_exits(get_proxies())
+    else:
+        _print_config_defaults(load_config())
+
+    print()
+    print("详情（全网络服务 / 候选节点 / 进程）：sb status -v")
+
+
+def _status_full(quick=False):
     print()
     print("== sing-box ==")
     procs = pgrep_singbox()
@@ -2707,6 +2822,11 @@ def do_tun(args):
         raise SbError("用法：sb tun on|off")
 
 
+def do_status(args):
+    verbose = any(a in ("-v", "--verbose", "-a", "--all") for a in args)
+    status(verbose=verbose)
+
+
 def do_proxy(args):
     action = args[0] if args else None
     if action == "clean":
@@ -2724,7 +2844,7 @@ def main():
     cmd, args = argv[0], argv[1:]
 
     noarg = {
-        "stop": stop, "restart": restart, "status": status,
+        "stop": stop, "restart": restart,
         "groups": groups,
         "api": api, "ui": ui, "conns": conns,
         "help": help_text, "-h": help_text, "--help": help_text,
@@ -2732,7 +2852,7 @@ def main():
     topics = {
         "sub": do_sub, "log": do_log, "test": do_test, "group": do_group,
         "rules": do_rules, "tun": do_tun, "proxy": do_proxy,
-        "start": do_start,
+        "start": do_start, "status": do_status,
     }
 
     try:
